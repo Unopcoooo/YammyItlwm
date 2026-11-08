@@ -479,6 +479,11 @@ iwm_binding_cmd(struct iwm_softc *sc, struct iwm_node *in, uint32_t action)
 int ItlIwm::
 iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 {
+#if defined(AIRPORT_WCL) && defined(AIRPORT_VTD)
+    ItlIbss::FirmwareCommandPermit ibssCommandPermit(awdlIbssExclusive,
+        reinterpret_cast<uintptr_t>(current_thread()));
+    if (!ibssCommandPermit) { hcmd->resp_pkt = nullptr; return EBUSY; }
+#endif
 #ifdef AIRPORT_VTD
     if (!getMainWorkLoop()->inGate()) {
         return getMainCommandGate()->runAction(
@@ -739,7 +744,16 @@ iwm_send_cmd_pdu(struct iwm_softc *sc, uint32_t id, uint32_t flags,
         .flags = flags,
     };
     
-    return iwm_send_cmd(sc, &cmd);
+#ifdef AIRPORT_WCL
+    // AWDL resource trace PDU begin; no native request mutation.
+    const uint32_t resourceToken=awdlP2pResourceSubmit(id,flags,len,data,false);
+#endif
+    const int result=iwm_send_cmd(sc, &cmd);
+#ifdef AIRPORT_WCL
+    // AWDL resource trace PDU end; native errno preserved.
+    awdlP2pResourceReturn(resourceToken,id,flags,result,false,UINT32_MAX);
+#endif
+    return result;
 }
 
 int ItlIwm::
@@ -784,7 +798,17 @@ iwm_send_cmd_pdu_status(struct iwm_softc *sc, uint32_t id, uint16_t len,
         .data = { data, },
     };
     
-    return iwm_send_cmd_status(sc, &cmd, status);
+#ifdef AIRPORT_WCL
+    // AWDL resource trace status begin; no native request mutation.
+    const uint32_t resourceToken=awdlP2pResourceSubmit(id,0,len,data,true);
+#endif
+    const int result=iwm_send_cmd_status(sc, &cmd, status);
+#ifdef AIRPORT_WCL
+    // AWDL resource trace status end; status read only on native decode success.
+    awdlP2pResourceReturn(resourceToken,id,0,result,result==0 && status!=nullptr,
+        result==0 && status!=nullptr?*status:UINT32_MAX);
+#endif
+    return result;
 }
 
 void ItlIwm::
@@ -810,6 +834,10 @@ iwm_cmd_done(struct iwm_softc *sc, int qid, int idx, int code)
     if (!data->commandPending)
         return;
     data->commandPending = false;
+#ifdef AIRPORT_WCL
+    if(code==IWM_BEACON_TEMPLATE_CMD)
+        awdlIbssExperimentEvent(16,uint32_t(code),0,uint32_t(idx),uint32_t(qid));
+#endif
 #endif
 
     

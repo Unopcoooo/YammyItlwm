@@ -7,6 +7,34 @@
 //
 #include "AirportItlwmV2.hpp"
 #include "AirportItlwmSkywalkInterface.hpp"
+#include "ItlAwdlInterface.hpp"
+#include "../itlwm/awdl/EngineState.hpp"
+
+// This adapter implements no SIB coexistence policy. Report both fields of
+// that software status, not an assertion about Broadcom/Intel hardware sensing.
+// Native core and consumer agree: active at +0, timeToTST at +4, size 8.
+struct ItlSibCoexStatus { uint32_t active; uint32_t timeToTST; };
+static_assert(sizeof(ItlSibCoexStatus) == 8, "Native SIB output size");
+IOReturn AirportItlwmSkywalkInterface::getSIB_COEX_STATUS(apple80211_sib_coex_status *data)
+{
+    static volatile SInt32 calls = 0;
+    const uint32_t count = static_cast<uint32_t>(OSIncrementAtomic(&calls)) + 1;
+    if (instance)
+        instance->setProperty("AWDLProbeSibCoexCalls", count, 32);
+    if (!data)
+        return kIOReturnBadArgument;
+    const ItlSibCoexStatus status = {0, 0};
+    memcpy(data, &status, sizeof(status));
+    return kIOReturnSuccess;
+}
+
+// Ordinary infrastructure channel changes are not AWDL master-channel requests.
+// This adapter has no implementation for the former.
+IOReturn AirportItlwmSkywalkInterface::setCHANNEL(apple80211_channel_data *)
+{
+    return kIOReturnUnsupported;
+}
+#include <IOKit/IOUserClient.h>
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
 #include <crypto/sha1.h>
@@ -20,6 +48,31 @@ extern IOCommandGate *_fCommandGate;
 
 #define super IO80211InfraProtocol
 OSDefineMetaClassAndStructors(AirportItlwmSkywalkInterface, IO80211InfraProtocol);
+
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
+IOReturn AirportItlwmSkywalkInterface::newUserClient(task_t task, void *security, unsigned int type,
+                                                  OSDictionary *properties, IOUserClient **handler)
+{
+    static volatile SInt32 calls = 0;
+    setProperty("AWDLTraceUserClientCalls", static_cast<unsigned long long>(static_cast<uint32_t>(OSIncrementAtomic(&calls)) + 1), 32);
+    setProperty("AWDLTraceUserClientType", type, 32);
+    // This is also InfraProtocol's native implementation on this machine.
+    const IOReturn result = handler
+        ? IO80211SkywalkInterface::newUserClient(task, security, type, properties, handler)
+        : kIOReturnBadArgument;
+    setProperty("AWDLTraceUserClientResult", static_cast<unsigned long long>(static_cast<uint32_t>(result)), 32);
+    setProperty("AWDLTraceUserClientReturned", result == kIOReturnSuccess && handler && *handler);
+    if (result == kIOReturnSuccess && handler && *handler)
+        setProperty("AWDLTraceUserClientClass", (*handler)->getMetaClass()->getClassName());
+    if (type < 8) {
+        char key[48];
+        snprintf(key, sizeof(key), "AWDLTraceClientType%uResult", type);
+        setProperty(key, static_cast<unsigned long long>(static_cast<uint32_t>(result)), 32);
+    }
+    return result;
+}
+#endif
+
 
 const char* hexdump(uint8_t *buf, size_t len) {
     ssize_t str_len = len * 3 + 1;
@@ -321,6 +374,96 @@ getSSID(struct apple80211_ssid_data *sd)
         return kIOReturnSuccess;
     }
     return 6;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setVIRTUAL_IF_CREATE(struct apple80211_virt_if_create_data *data)
+{
+    if (!instance || !data)
+        return kIOReturnBadArgument;
+    static volatile SInt32 calls = 0;
+    const uint32_t count = static_cast<uint32_t>(OSIncrementAtomic(&calls)) + 1;
+    instance->setProperty("VifCreateCalls", static_cast<unsigned long long>(count), 32);
+    instance->setProperty("VifCreateRawRole", data->role, 32);
+    char requestedName[sizeof(data->bsd_name) + 1] = {};
+    memcpy(requestedName, data->bsd_name, sizeof(data->bsd_name));
+    instance->setProperty("VifCreateRawName", requestedName);
+    instance->setProperty("VifCreateRequestedMAC", data->mac, sizeof(data->mac));
+    // The compiled Sequoia ABI defines AWDL as 6, P2P client as 4. A name
+    // prefix cannot grant an unrelated role access to this AWDL-only path.
+    if (data->role != APPLE80211_VIF_AWDL) {
+        instance->setProperty("VifCreateResult", "unsupported-role-v42");
+        return kIOReturnUnsupported;
+    }
+    instance->setProperty("VifCreateAcceptedRole", data->role, 32);
+    instance->setProperty("VifCreateRole", data->role, 32);
+    if (instance->fAWDLInterface) {
+        auto existing = instance->fAWDLInterface;
+        if (existing->isInactive() || !existing->getProperty("AWDLProbeBridgeAttached")) {
+            instance->setProperty("VifCreateResult", "existing-not-ready-v42");
+            return kIOReturnNotReady;
+        }
+        ether_addr current = {};
+        const IOReturn status = existing->getHardwareAddress(&current);
+        bool requestedZero = true;
+        for (unsigned i = 0; i < sizeof(data->mac); ++i)
+            requestedZero = requestedZero && data->mac[i] == 0;
+        if (status != kIOReturnSuccess ||
+            (!requestedZero && memcmp(data->mac, current.octet, sizeof(data->mac)) != 0)) {
+            instance->setProperty("VifCreateResult", "existing-mac-conflict-v42");
+            return kIOReturnExclusiveAccess;
+        }
+        bzero(data->bsd_name, sizeof(data->bsd_name));
+        memcpy(data->bsd_name, "awdl0", sizeof("awdl0"));
+        instance->setProperty("VifCreateResult", "existing-ready-v42");
+        return kIOReturnSuccess;
+    }
+    // Prefer the address user space asked for; fall back to the derived AWDL
+    // address only when it sent an all-zero one.
+    struct ether_addr address;
+    memcpy(address.octet, data->mac, 6);
+    bool requestedIsZero = true;
+    for (int i = 0; i < 6; ++i)
+        if (address.octet[i]) requestedIsZero = false;
+    if (requestedIsZero) {
+        IOEthernetAddress primary;
+        if (instance->getHardwareAddress(&primary) == kIOReturnSuccess) {
+            memcpy(&address, &primary, sizeof(address));
+            address.octet[0] = (address.octet[0] | 0x02) & 0xfe;
+            address.octet[5] ^= 0x01;
+        }
+    }
+    instance->setProperty("VifCreateMacWasZero", requestedIsZero);
+    // attachVirtualInterface() calls the controller factory (which allocates and
+    // initializes the object), then attach(this). Registration and publication are
+    // done below so the data-path resources exist before the BSD bridge matches.
+    IO80211VirtualInterface *inf = nullptr;
+    if (!instance->attachVirtualInterface(&inf, &address, data->role, false) || !inf) {
+        instance->setProperty("VifCreateResult", "factory-or-attach-failed");
+        return kIOReturnError;
+    }
+    ItlAwdlInterface *awdl = static_cast<ItlAwdlInterface *>(inf);
+    const bool started = awdl->IO80211VirtualInterface::start(instance);
+    instance->setProperty("VifCreateStartOK", started);
+    const bool resources = started && awdl->probeRegisterResources(instance, address);
+    instance->setProperty("VifCreateResourcesOK", resources);
+    if (!resources) {
+        awdl->IO80211VirtualInterface::detach(instance);
+        awdl->release();
+        instance->setProperty("VifCreateResult", "start-or-resources-failed");
+        return kIOReturnError;
+    }
+    // Hand the allocation reference to the controller and tell the family about
+    // the interface, then publish so IOSkywalkLegacyEthernet can build awdl0.
+    instance->fAWDLInterface = awdl;
+    instance->setAwdlInterface(awdl);
+    awdl->setProperty("AWDLProbeDataPath", "unsupported");
+    awdl->removeProperty("IOInterfaceUnit");
+    awdl->IOSkywalkNetworkInterface::deferBSDAttach(false);
+    instance->setProperty("VifCreateResult", "created-and-published-v42");
+    // Probe50: mark the build so the acceptance run can be attributed.
+    instance->setProperty("AWDLProbeAdapterVersion", "probe50");
+    return kIOReturnSuccess;
 }
 
 IOReturn AirportItlwmSkywalkInterface::

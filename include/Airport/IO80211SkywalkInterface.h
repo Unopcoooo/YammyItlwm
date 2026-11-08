@@ -153,7 +153,7 @@ public:
     virtual void *getWorkerMatchingDict(OSString *);
     virtual bool init(IOService *);
     virtual bool isInterfaceEnabled(void);
-    virtual ether_addr *getSelfMacAddr(void);
+    virtual uint64_t getSelfMacAddr(void); // Native x86_64 ABI: packed address value.
     virtual void setSelfMacAddr(ether_addr *);
     virtual void *getPacketPool(OSString *);
     virtual void *getLogger(void);

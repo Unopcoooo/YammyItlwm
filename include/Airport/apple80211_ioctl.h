@@ -910,6 +910,11 @@ struct apple80211_awdl_election_metric
 {
     uint32_t    version;
     uint32_t    metric;
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
+    // 24H32 PeerManager consumes +8 before forwarding to the backend.
+    uint8_t     override_metric;
+    uint8_t     reserved[3];
+#endif
 } __attribute__((packed));
 
 struct apple80211_awdl_sync_enabled
@@ -1039,6 +1044,14 @@ struct apple80211_awdl_extension_state_machine_parameter {
 struct apple80211_awdl_sync_state {
     uint32_t    version;
     uint32_t    state;
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
+    // 24H32 wire layout; role is not a link/RUNNING boolean.
+    uint8_t     target_address[6];
+    uint8_t     reserved14[2];
+    uint32_t    mode_parameter;
+    uint8_t     opmode_flags;
+    uint8_t     reserved21[3];
+#endif
 } __attribute__((packed));
 
 struct apple80211_awdl_sync_params {
@@ -1047,7 +1060,33 @@ struct apple80211_awdl_sync_params {
     uint32_t    availability_window_period;
     uint32_t    extension_length;
     uint32_t    synchronization_frame_period;
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
+    // Native getter/setter access +20; units and valid ranges remain unverified.
+    uint32_t    non_election_broadcast_period;
+#endif
 } __attribute__((packed));
+
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
+// Verified against 15.8.1/24H32 IO80211Family 13D3592A and BCMCore 166A4B04.
+// Layout only: unsupported backend operations must still return Unsupported.
+static_assert(sizeof(apple80211_awdl_sync_state) == 24, "24H32 sync-state wire size");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_state, state) == 4, "24H32 role");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_state, target_address) == 8, "24H32 target address");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_state, reserved14) == 14, "24H32 reserved bytes");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_state, mode_parameter) == 16, "24H32 mode parameter");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_state, opmode_flags) == 20, "24H32 opmode flags");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_state, reserved21) == 21, "24H32 reserved tail");
+static_assert(sizeof(apple80211_awdl_sync_params) == 24, "24H32 sync-params wire size");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_params, availability_window_length) == 4, "24H32 aw length");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_params, availability_window_period) == 8, "24H32 aw period");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_params, extension_length) == 12, "24H32 aw extension");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_params, synchronization_frame_period) == 16, "24H32 advertisement period");
+static_assert(__builtin_offsetof(apple80211_awdl_sync_params, non_election_broadcast_period) == 20, "24H32 broadcast period");
+static_assert(sizeof(apple80211_awdl_election_metric) == 12, "24H32 metric wire size");
+static_assert(__builtin_offsetof(apple80211_awdl_election_metric, metric) == 4, "24H32 metric");
+static_assert(__builtin_offsetof(apple80211_awdl_election_metric, override_metric) == 8, "24H32 PM override");
+static_assert(__builtin_offsetof(apple80211_awdl_election_metric, reserved) == 9, "24H32 reserved tail");
+#endif
 
 struct apple80211_awdl_cap {
     uint32_t    version;

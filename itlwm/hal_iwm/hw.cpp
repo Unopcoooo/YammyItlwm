@@ -717,9 +717,17 @@ iwm_stop_device(struct iwm_softc *sc)
 #ifdef AIRPORT_VTD
     sc->sc_pcitag->setBusMasterEnable(false);
     iwm_reset_rx_ring(sc, &sc->rxq);
+#ifdef AIRPORT_WCL
+    // Hardware reset + bus master off + RX notification ring reset, before TX free.
+    awdlIbssTxStopped();
+    awdlIbssPeerStopped();
+#endif
 
     for (qid = 0; qid < nitems(sc->txq); qid++)
         iwm_reset_tx_ring(sc, &sc->txq[qid]);
+#endif
+#ifdef AIRPORT_WCL
+    awdlRocQuiesced();
 #endif
     
     /*

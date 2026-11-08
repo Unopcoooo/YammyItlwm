@@ -224,6 +224,17 @@ iwm_init_channel_map(struct iwm_softc *sc, const uint16_t * const nvm_ch_flags,
             !data->sku_cap_band_52GHz_enable)
             ch_flags &= ~IWM_NVM_CHANNEL_VALID;
         
+#ifdef AIRPORT_WCL
+        // AWDL read-only NVM permission snapshot; leave native map unchanged.
+        if(awdlProbeCounters) {
+            using D=ItlIbss::ExperimentObservation;auto &d=awdlProbeCounters->ibss;
+            const unsigned number=nvm_channels[ch_idx];
+            if(number==6)d.set(D::NvmFlags6,ch_flags);
+            if(number==44)d.set(D::NvmFlags44,ch_flags);
+            if(number==149)d.set(D::NvmFlags149,ch_flags);
+            d.set(D::NvmChannelFlagsVersion,1);
+        }
+#endif
         if (!(ch_flags & IWM_NVM_CHANNEL_VALID))
             continue;
         
@@ -925,6 +936,254 @@ out:
     return ret;
 }
 
+#ifdef AIRPORT_WCL
+#include "../awdl/AuxRocRuntime.hpp"
+#include "../awdl/RawRxRuntime.hpp"
+#include "../awdl/AuxTxRuntime.hpp"
+#include "../awdl/IbssWaitRuntime.hpp"
+#include "../awdl/IbssIwmRuntime.hpp"
+#include "../awdl/IbssLifecycleTraceRuntime.hpp"
+#include "../awdl/ResourceTraceRuntime.hpp"
+#include "../awdl/IbssExclusiveRuntime.hpp"
+#include "../awdl/IbssProfileRuntime.hpp"
+#include "../awdl/IbssTxRuntime.hpp"
+#include "../awdl/IbssPeerRuntime.hpp"
+#include "../awdl/ListenerTxRuntime.hpp"
+#include "../awdl/IbssDataTrialRuntime.hpp"
+#include "../awdl/ListenerInjectionRuntime.hpp"
+#include "../awdl/IbssScheduledControlRuntime.hpp"
+#include "../awdl/IbssNativeDataRuntime.hpp"
+#include "../awdl/IbssExperimentRuntime.hpp"
+#include "../awdl/NativeSearchRuntime.hpp"
+#include "../awdl/NativeSyncPreflightRuntime.hpp"
+#include "../awdl/NativeSearchControlTxRuntime.hpp"
+#include "../awdl/NativeSyncRoleRuntime.hpp"
+#include "../awdl/NativeDiscoveryPeerRuntime.hpp"
+#include "../awdl/NativeDiscoveryRuntime.hpp"
+#include "../awdl/NativeSyncParamsRuntime.hpp"
+#include "../awdl/BatchRuntime.hpp"
+#include "../awdl/ActionFrame.hpp"
+#include "../awdl/ChannelSequence.hpp"
+#include "../awdl/ElectionParameters.hpp"
+#include "../awdl/SyncParameters.hpp"
+
+void ItlIwm::observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2)
+{
+    if (!awdlProbeEnabled || !frame)
+        return;
+    if (!awdlProbeRxSeen) {
+        awdlProbeRxSeen = true;
+        IOLog("itlwm-awdl-probe: RX path active\n");
+    }
+    using Counters = ItlAwdlProbeCounters;
+    awdlProbeCounters->add(Counters::RxFrames);
+    // Diagnostic attribution only: require the confirmed START, matching
+    // generation/channel and an RX GP2 within the requested 16-TU window.
+    const bool withinRoc = awdlRocSession.phase == ItlAwdl::RocPhase::Running &&
+        awdlRocSession.generation == uint32_t(com.sc_generation) &&
+        channel == int(awdlRocChannel) && uint32_t(receiveGp2 - awdlRocSession.startGp2) < awdlRocDurationTu * 1024u;
+    if (withinRoc) {
+        awdlProbeCounters->add(Counters::RocFramesOnChannel);
+        ++awdlRocRxFrames;
+        if (channel != int(awdlRocHomeChannel)) ++awdlRocOffHomeFrames;
+    }
+    size_t length = mbuf_len(frame);
+    if (length != mbuf_pkthdr_len(frame)) {
+        awdlProbeCounters->add(Counters::SplitBuffer);
+        return;
+    }
+    if (length > 4096) {
+        awdlProbeCounters->add(Counters::Oversize);
+        return;
+    }
+    const auto bytes = static_cast<const uint8_t *>(mbuf_data(frame));
+    if (withinRoc && length>=24 && bytes[0]==0x80) ++awdlRocBeaconFrames;
+    if (length < 2 || bytes[0] != 0xd0)
+        return;
+    awdlProbeCounters->add(Counters::ActionFrames);
+    if(awdlListenerActive()&&awdlIbssExclusive.ownsRadio&&awdlProbeCounters->ibss.captures(uint32_t(com.sc_generation),itlAwdlRocNowNs())){
+        bool verified=false;length=ItlAwdl::observerFrameLength(bytes,length,true,verified);
+    }
+    ItlAwdl::Summary summary;
+    const auto result = ItlAwdl::inspect(bytes, length, summary);
+    switch (result) {
+        case ItlAwdl::Result::Valid: awdlProbeCounters->add(Counters::ValidAwdl); break;
+        case ItlAwdl::Result::Truncated:
+        case ItlAwdl::Result::Malformed: awdlProbeCounters->add(Counters::InvalidAction); return;
+        case ItlAwdl::Result::Unsupported: awdlProbeCounters->add(Counters::UnsupportedAction); return;
+        case ItlAwdl::Result::NotAwdl: awdlProbeCounters->add(Counters::OtherAction); return;
+    }
+    const auto ic = &com.sc_ic;
+    if (withinRoc) { awdlProbeCounters->add(Counters::RocAwdlFramesOnChannel);++awdlRocAwdlFrames; }
+    awdlProbeCounters->add(ic->ic_state == IEEE80211_S_RUN ? Counters::AwdlDuringRun : Counters::AwdlOutsideRun);
+    awdlProbeCounters->add(channel == 6 ? Counters::AwdlChannel6 :
+                          channel == 44 ? Counters::AwdlChannel44 :
+                          channel == 149 ? Counters::AwdlChannel149 : Counters::AwdlOtherChannel);
+    // TLV-level scan. inspect() has already validated every envelope in this
+    // frame, so this second bounded pass trusts the bounds but not the values.
+    // Nothing here acts on what it reads: no channel change, no transmit.
+    const size_t start = 24 + ((bytes[1] & 0x80) ? 4 : 0) + 16;
+    const uint8_t *p = bytes + start;
+    size_t remaining = length - start;
+    bool sawSync = false, sawChanSeq = false, sawV1 = false, sawV2 = false;
+    uint8_t chanSeqEncoding = 0xff;
+    uint16_t chanSeqCount = 0;
+    ItlAwdl::SyncParameters lastSync = {};
+    ItlAwdl::ElectionParameters lastElection = {};
+    ItlAwdl::ChannelSequence lastSequence = {};
+    bool haveSyncValue = false, haveElectionValue = false, haveSequence = false;
+    while (remaining >= 3) {
+        const size_t valueLength = size_t(p[1]) | (size_t(p[2]) << 8);
+        if (valueLength > remaining - 3) break; // unreachable after inspect()
+        switch (p[0]) {
+        case 4: {
+            sawSync = true;
+            awdlProbeCounters->add(Counters::TlvSync);
+            ItlAwdl::SyncParameters sync = {};
+            if (ItlAwdl::decodeSyncParameters(p + 3, valueLength, sync)) {
+                awdlProbeCounters->add(Counters::SyncDecodeOk);
+                lastSync = sync;
+                haveSyncValue = true;
+                awdlProbeCounters->add(sync.nextChannel == 6 ? Counters::SyncNextChannel6 :
+                                       sync.nextChannel == 44 ? Counters::SyncNextChannel44 :
+                                       sync.nextChannel == 149 ? Counters::SyncNextChannel149 :
+                                                                 Counters::SyncNextChannelOther);
+            } else {
+                awdlProbeCounters->add(Counters::SyncDecodeErrors);
+            }
+            break;
+        }
+        case 5: {
+            sawV1 = true;
+            awdlProbeCounters->add(Counters::TlvElectionV1);
+            ItlAwdl::ElectionParameters election = {};
+            const bool decoded = ItlAwdl::decodeElectionV1(p + 3, valueLength, election);
+            if (decoded && !haveElectionValue) {
+                lastElection = election;
+                haveElectionValue = true;
+            }
+            awdlProbeCounters->add(decoded ? Counters::ElectionDecodeOk
+                                           : Counters::ElectionDecodeErrors);
+            break;
+        }
+        case 24: {
+            sawV2 = true;
+            awdlProbeCounters->add(Counters::TlvElectionV2);
+            ItlAwdl::ElectionParameters election = {};
+            const bool decoded = ItlAwdl::decodeElectionV2(p + 3, valueLength, election);
+            if (decoded) { // v2 wins over v1 within one frame, as in the decoder
+                lastElection = election;
+                haveElectionValue = true;
+            }
+            awdlProbeCounters->add(decoded ? Counters::ElectionDecodeOk
+                                           : Counters::ElectionDecodeErrors);
+            break;
+        }
+        case 18: {
+            sawChanSeq = true;
+            awdlProbeCounters->add(Counters::TlvChanSeq);
+            // The encoding byte is read before decoding so that unsupported
+            // encodings stay visible in the distribution, not only as an error.
+            chanSeqEncoding = valueLength >= 2 ? p[4] : 0xff;
+            awdlProbeCounters->add(chanSeqEncoding == 0 ? Counters::ChanSeqEncodingSimple :
+                                   chanSeqEncoding == 1 ? Counters::ChanSeqEncodingLegacy :
+                                   chanSeqEncoding == 3 ? Counters::ChanSeqEncodingOpclass :
+                                                          Counters::ChanSeqEncodingUnsupported);
+            ItlAwdl::ChannelSequence sequence = {};
+            size_t consumed = 0;
+            if (ItlAwdl::decodeChannelSequence(p + 3, valueLength, sequence, consumed) ==
+                ItlAwdl::ChannelDecode::Valid) {
+                chanSeqCount = sequence.count;
+                lastSequence = sequence;
+                haveSequence = true;
+                awdlProbeCounters->add(sequence.count == ItlAwdl::kChannelSequenceSlots ?
+                                       Counters::ChanSeqCount16 : Counters::ChanSeqCountOther);
+                awdlProbeCounters->add(Counters::ChanSeqDecodeOk);
+            } else {
+                awdlProbeCounters->add(Counters::ChanSeqDecodeErrors);
+            }
+            break;
+        }
+        default:
+            awdlProbeCounters->add(Counters::TlvOther);
+            break;
+        }
+        p += 3 + valueLength;
+        remaining -= 3 + valueLength;
+    }
+    if (sawSync && sawChanSeq)
+        awdlProbeCounters->add(Counters::SyncWithChanSeqFrames);
+    // Publish the raw numbers of this frame for later retrieval through
+    // IORegistry, which survives where the attach-time log lines did not.
+    awdlProbeCounters->recordLastField(Counters::LastChannel, (uint32_t)channel);
+    awdlProbeCounters->recordLastField(Counters::LastFrameLength, (uint32_t)length);
+    awdlProbeCounters->noteSender(bytes + 10); // address 2, the transmitter
+    if (haveSyncValue) {
+        awdlProbeCounters->recordLastField(Counters::LastNextChannel, lastSync.nextChannel);
+        awdlProbeCounters->recordLastField(Counters::LastMasterChannel, lastSync.masterChannel);
+        awdlProbeCounters->recordLastField(Counters::LastGuardTime, lastSync.guardTime);
+        awdlProbeCounters->recordLastField(Counters::LastAwPeriod, lastSync.awPeriod);
+        awdlProbeCounters->recordLastField(Counters::LastAfPeriod, lastSync.afPeriod);
+        awdlProbeCounters->recordLastField(Counters::LastPresenceMode, lastSync.presenceMode);
+        awdlProbeCounters->recordLastField(Counters::LastNextAwSequence, lastSync.nextAwSequence);
+        awdlProbeCounters->recordLastField(Counters::LastTxDownCounter, lastSync.txDownCounter);
+        awdlProbeCounters->recordLastField(Counters::LastFlags, lastSync.flags);
+        awdlProbeCounters->recordLastField(Counters::LastAwExtensionLength, lastSync.awExtensionLength);
+        awdlProbeCounters->recordLastField(Counters::LastAwCommonLength, lastSync.awCommonLength);
+        awdlProbeCounters->recordLastField(Counters::LastRemainingAwLength, lastSync.remainingAwLength);
+        awdlProbeCounters->recordLastField(Counters::LastMinExtension, lastSync.minExtension);
+        awdlProbeCounters->recordLastField(Counters::LastMaxMulticastExtension, lastSync.maxMulticastExtension);
+        awdlProbeCounters->recordLastField(Counters::LastMaxUnicastExtension, lastSync.maxUnicastExtension);
+        awdlProbeCounters->recordLastField(Counters::LastMaxActionExtension, lastSync.maxActionExtension);
+        awdlProbeCounters->recordLastField(Counters::LastApAlignment, lastSync.apAlignment);
+    }
+    if (haveElectionValue) {
+        awdlProbeCounters->recordLastField(Counters::LastMasterMetric, lastElection.masterMetric);
+        awdlProbeCounters->recordLastField(Counters::LastMasterCounter, lastElection.masterCounter);
+        awdlProbeCounters->recordLastField(Counters::LastHeight, lastElection.height);
+        awdlProbeCounters->recordLastField(Counters::LastSelfMetric, lastElection.selfMetric);
+        awdlProbeCounters->recordLastField(Counters::LastSelfCounter, lastElection.selfCounter);
+    }
+    if (haveSequence) {
+        awdlProbeCounters->recordLastField(Counters::LastChanSeqEncoding, lastSequence.encoding);
+        awdlProbeCounters->recordLastField(Counters::LastChanSeqCount, lastSequence.count);
+        awdlProbeCounters->recordLastField(Counters::LastChanSeqSteps, lastSequence.steps);
+        awdlProbeCounters->recordLastField(Counters::LastChanSeqDuplicates, lastSequence.duplicates);
+        awdlProbeCounters->recordLastField(Counters::LastChanSeqFill, lastSequence.fill);
+        awdlProbeCounters->recordLastField(Counters::LastChanSeqFirstChannel,
+                                           lastSequence.entries[0].channel);
+        // Every slot, packed as channel | auxiliary << 16. Slots beyond the
+        // advertised count stay 0, which no real entry uses.
+        for (unsigned i = 0; i < ItlAwdl::kChannelSequenceSlots; ++i) {
+            const uint32_t packed = i < lastSequence.count
+                ? uint32_t(lastSequence.entries[i].channel) |
+                      (uint32_t(lastSequence.entries[i].auxiliary) << 16)
+                : 0;
+            awdlProbeCounters->recordLastField(
+                static_cast<Counters::LastField>(Counters::LastChanSeqEntry0 + i), packed);
+        }
+    }
+    awdlProbeCounters->observeProtocol(bytes, length, receiveGp2, com.sc_generation, (getMainWorkLoop()&&getMainWorkLoop()->inGate()&&awdlNativeSearch.active())?awdlNativeSearch.local:ic->ic_myaddr);
+    awdlProbeCounters->finishLastFrame();
+    if (sawV1 && sawV2)
+        awdlProbeCounters->add(Counters::ElectionBothFrames);
+    else if (sawV2)
+        awdlProbeCounters->add(Counters::ElectionV2Frames);
+    else if (sawV1)
+        awdlProbeCounters->add(Counters::ElectionV1OnlyFrames);
+    else
+        awdlProbeCounters->add(Counters::ElectionNoneFrames);
+    if (awdlProbeLogged >= 8)
+        return;
+    ++awdlProbeLogged;
+    IOLog("itlwm-awdl-probe: sample=%u channel=%d subtype=%u tlvs=%u sync=%u electionV1=%u electionV2=%u "
+          "chanseq=%u chanseqEncoding=%u chanseqCount=%u\n",
+          awdlProbeLogged, channel, unsigned(summary.subtype), unsigned(summary.tlvs),
+          unsigned(summary.sync), unsigned(sawV1), unsigned(sawV2),
+          unsigned(summary.channelSequence), unsigned(chanSeqEncoding), unsigned(chanSeqCount));
+}
+#endif
+
 void ItlIwm::
 iwm_rx_frame(struct iwm_softc *sc, mbuf_t m, int chanidx,
              uint32_t rx_pkt_status, int is_shortpre, int rate_n_flags,
@@ -939,6 +1198,19 @@ iwm_rx_frame(struct iwm_softc *sc, mbuf_t m, int chanidx,
     if (chanidx < 0 || chanidx >= nitems(ic->ic_channels))
         chanidx = ieee80211_chan2ieee(ic, ic->ic_ibss_chan);
     
+#ifdef AIRPORT_WCL
+    awdlIbssExperimentCommon(m,chanidx,device_timestamp,rx_pkt_status);
+    awdlRawRxCommon(m,chanidx,device_timestamp,rx_pkt_status);
+    observeAwdlFrame(m, chanidx, device_timestamp);
+    if(ItlAwdl::gSingleDataProbe.submitted&&mbuf_len(m)==mbuf_pkthdr_len(m)&&
+       ItlAwdl::gSingleDataProbe.reply(static_cast<const uint8_t *>(mbuf_data(m)),mbuf_len(m),
+           sc->sc_generation,chanidx,device_timestamp,itlAwdlRocNowNs()))awdlSingleDataProbePublish();
+    // Search observations stay in the probe model, outside ordinary BSD input.
+    if(awdlNativeSearchConsumeRx()){
+        if(mbuf_len(m)==mbuf_pkthdr_len(m))awdlNativeDiscoveryReceive(static_cast<const uint8_t*>(mbuf_data(m)),mbuf_len(m),unsigned(chanidx),device_timestamp);
+        mbuf_freem(m);return;
+    }
+#endif
     wh = mtod(m, struct ieee80211_frame *);
     ni = ieee80211_find_rxnode(ic, wh);
     if ((rxi->rxi_flags & IEEE80211_RXI_HWDEC) &&
@@ -1358,6 +1630,15 @@ iwm_rx_tx_cmd_single(struct iwm_softc *sc, struct iwm_tx_resp *tx_resp,
         struct ieee80211_tx_info *info = &txd->info;
         bool flushed = false;
         if (txd->m != NULL) {
+#ifdef AIRPORT_WCL
+            const int ibssTx=awdlIbssTxComplete(qid,ring->tail,status);
+            if(ibssTx==2)continue; // IBSS reclaim advanced its one owned tail.
+            if(ibssTx==1)return; // stale/deferred owned completion cannot reach STA free.
+            if (awdlAuxTxComplete(qid, ring->tail, status)) {
+                ring->tail = (ring->tail + 1) % IWM_TX_RING_COUNT;
+                continue;
+            }
+#endif
             skb_freed++;
 
             memset(&info->status, 0, sizeof(info->status));
@@ -1510,6 +1791,10 @@ iwm_rx_tx_cmd(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
     bus_dmamap_sync(sc->sc_dmat, data->map, 0, IWM_RBUF_SIZE,
                     BUS_DMASYNC_POSTREAD);
     
+#ifdef AIRPORT_WCL
+    // Exclusive unicast queues must never reach ordinary STA/A-MPDU cleanup.
+    if (awdlIbssPeerTxComplete(unsigned(qid),unsigned(idx),pkt->data,len)) return;
+#endif
     /* Sanity checks. */
     if (sizeof(*tx_resp) > len)
         return;
@@ -1520,6 +1805,11 @@ iwm_rx_tx_cmd(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
     if (sizeof(*tx_resp) + sizeof(ssn) +
         tx_resp->frame_count * sizeof(struct iwm_agg_tx_status) > len)
         return;
+
+#ifdef AIRPORT_WCL
+    // Observe the owned response before the normal completion releases its DMA.
+    if (qid == 2) awdlListenerTxResponse(unsigned(qid),unsigned(idx),pkt->data,len);
+#endif
     
     sc->sc_tx_timer[qid] = 0;
     
@@ -1679,6 +1969,10 @@ iwm_tx_fill_cmd(struct iwm_softc *sc, struct iwm_node *in,
 int ItlIwm::
 iwm_tx(struct iwm_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
 {
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) { mbuf_freem(m); return EBUSY; }
+#endif
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwm_node *in = (struct iwm_node *)ni;
     struct iwm_tx_ring *ring;
@@ -2221,7 +2515,21 @@ iwm_mac_ctxt_cmd(struct iwm_softc *sc, struct iwm_node *in, uint32_t action,
     else
         iwm_mac_ctxt_cmd_fill_sta(sc, in, &cmd.sta, assoc);
     
-    return iwm_send_cmd_pdu(sc, IWM_MAC_CONTEXT_CMD, 0, sizeof(cmd), &cmd);
+#ifdef AIRPORT_WCL
+    // Keep the station connection and existing data/decryption filters. Request
+    // management/control delivery only; do not enable monitor mode or append FCS.
+    const bool probeMgmt = awdlMgmtFilterEnabled && ic->ic_opmode == IEEE80211_M_STA &&
+                           action != IWM_FW_CTXT_ACTION_REMOVE;
+    if (probeMgmt)
+        cmd.filter_flags |= htole32(IWM_MAC_FILTER_IN_CONTROL_AND_MGMT);
+#endif
+    const int result = iwm_send_cmd_pdu(sc, IWM_MAC_CONTEXT_CMD, 0, sizeof(cmd), &cmd);
+#ifdef AIRPORT_WCL
+    if (probeMgmt && awdlProbeCounters)
+        awdlProbeCounters->add(result == 0 ? ItlAwdlProbeCounters::MgmtFilterCmdsCompleted :
+                                            ItlAwdlProbeCounters::MgmtFilterCmdErrors);
+#endif
+    return result;
 }
 
 int ItlIwm::
@@ -2303,6 +2611,10 @@ iwm_update_quotas(struct iwm_softc *sc, struct iwm_node *in, int running)
 int ItlIwm::
 iwm_auth(struct iwm_softc *sc)
 {
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
@@ -2476,6 +2788,10 @@ iwm_deauth(struct iwm_softc *sc)
 int ItlIwm::
 iwm_run(struct iwm_softc *sc)
 {
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
@@ -2813,6 +3129,16 @@ iwm_calib_timeout(void *arg)
 {
     struct iwm_softc *sc = (struct iwm_softc *)arg;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return;
+#endif
+#ifdef AIRPORT_WCL
+    const int generation = sc->sc_generation;
+    ItlAwdlRocLifetime rocLifetime(that->awdlRocChannel ? that : nullptr,
+        that->awdlRocChannel ? that->getMainCommandGate() : nullptr,
+        that->awdlRocChannel ? that->getMainWorkLoop() : nullptr);
+#endif
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
     struct ieee80211_node *ni = &in->in_ni;
@@ -2838,6 +3164,11 @@ iwm_calib_timeout(void *arg)
     
     splx(s);
     
+#ifdef AIRPORT_WCL
+    that->awdlRocTick();
+    if (that->awdlRocChannel && (generation != sc->sc_generation ||
+        (sc->sc_flags & IWM_FLAG_SHUTDOWN) || ic->ic_state != IEEE80211_S_RUN)) return;
+#endif
     timeout_add_msec(&sc->sc_calib_to, 500);
 }
 
@@ -3067,6 +3398,10 @@ iwm_newstate_task(void *psc)
     struct iwm_softc *sc = (struct iwm_softc *)psc;
     ItlIwm *that = container_of(sc, ItlIwm, com);
     struct ieee80211com *ic = &sc->sc_ic;
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return;
+#endif
     enum ieee80211_state nstate = sc->ns_nstate;
     enum ieee80211_state ostate = ic->ic_state;
     int arg = sc->ns_arg;
@@ -3171,11 +3506,18 @@ iwm_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
      * triggers another scan iteration. And AUTH -> AUTH is needed
      * to support band-steering.
      */
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
     if (sc->ns_nstate == nstate && nstate != IEEE80211_S_SCAN &&
         nstate != IEEE80211_S_AUTH)
         return 0;
     
     if (ic->ic_state == IEEE80211_S_RUN) {
+#ifdef AIRPORT_WCL
+        that->awdlRocCancel();
+#endif
         if (nstate == IEEE80211_S_SCAN) {
              /*
               * During RUN->SCAN we don't call sc_newstate() so
@@ -3356,30 +3698,30 @@ iwm_init_hw(struct iwm_softc *sc)
     struct ieee80211com *ic = &sc->sc_ic;
     int err, i, ac, qid;
     
-    err = iwm_preinit(sc);
+    err = awdlIbssInitStep(196609,[&]{return iwm_preinit(sc);});
     if (err)
         return err;
     
-    err = iwm_start_hw(sc);
+    err = awdlIbssInitStep(196610,[&]{return iwm_start_hw(sc);});
     if (err) {
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
     
-    err = iwm_run_init_mvm_ucode(sc, 0);
+    err = awdlIbssInitStep(196611,[&]{return iwm_run_init_mvm_ucode(sc, 0);});
     if (err)
         return err;
     
     /* Should stop and start HW since INIT image just loaded. */
     iwm_stop_device(sc);
-    err = iwm_start_hw(sc);
+    err = awdlIbssInitStep(196612,[&]{return iwm_start_hw(sc);});
     if (err) {
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
     
     /* Restart, this time with the regular firmware */
-    err = iwm_load_ucode_wait_alive(sc, IWM_UCODE_TYPE_REGULAR);
+    err = awdlIbssInitStep(196613,[&]{return iwm_load_ucode_wait_alive(sc, IWM_UCODE_TYPE_REGULAR);});
     if (err) {
         XYLog("%s: could not load firmware\n", DEVNAME(sc));
         goto err;
@@ -3388,28 +3730,28 @@ iwm_init_hw(struct iwm_softc *sc)
     if (!iwm_nic_lock(sc))
         return EBUSY;
     
-    err = iwm_send_tx_ant_cfg(sc, iwm_fw_valid_tx_ant(sc));
+    err = awdlIbssInitStep(196614,[&]{return iwm_send_tx_ant_cfg(sc, iwm_fw_valid_tx_ant(sc));});
     if (err) {
         XYLog("%s: could not init tx ant config (error %d)\n",
               DEVNAME(sc), err);
         goto err;
     }
     
-    err = iwm_send_phy_db_data(sc);
+    err = awdlIbssInitStep(196615,[&]{return iwm_send_phy_db_data(sc);});
     if (err) {
         XYLog("%s: could not init phy db (error %d)\n",
               DEVNAME(sc), err);
         goto err;
     }
     
-    err = iwm_send_phy_cfg_cmd(sc);
+    err = awdlIbssInitStep(196616,[&]{return iwm_send_phy_cfg_cmd(sc);});
     if (err) {
         XYLog("%s: could not send phy config (error %d)\n",
               DEVNAME(sc), err);
         goto err;
     }
     
-    err = iwm_send_bt_init_conf(sc);
+    err = awdlIbssInitStep(196617,[&]{return iwm_send_bt_init_conf(sc);});
     if (err) {
         XYLog("%s: could not init bt coex (error %d)\n",
               DEVNAME(sc), err);
@@ -3418,19 +3760,19 @@ iwm_init_hw(struct iwm_softc *sc)
     
     if (isset(sc->sc_enabled_capa,
               IWM_UCODE_TLV_CAPA_SOC_LATENCY_SUPPORT)) {
-        err = iwm_send_soc_conf(sc);
+        err = awdlIbssInitStep(196618,[&]{return iwm_send_soc_conf(sc);});
         if (err)
             return err;
     }
     
     if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_DQA_SUPPORT)) {
-        err = iwm_send_dqa_cmd(sc);
+        err = awdlIbssInitStep(196619,[&]{return iwm_send_dqa_cmd(sc);});
         if (err)
             return err;
     }
     
     /* Add auxiliary station for scanning */
-    err = iwm_add_aux_sta(sc);
+    err = awdlIbssInitStep(196620,[&]{return iwm_add_aux_sta(sc);});
     if (err) {
         XYLog("%s: could not add aux station (error %d)\n",
               DEVNAME(sc), err);
@@ -3445,8 +3787,8 @@ iwm_init_hw(struct iwm_softc *sc)
          */
         sc->sc_phyctxt[i].id = i;
         sc->sc_phyctxt[i].channel = &ic->ic_channels[1];
-        err = iwm_phy_ctxt_cmd(sc, &sc->sc_phyctxt[i], 1, 1,
-                               IWM_FW_CTXT_ACTION_ADD, 0);
+        err = awdlIbssInitStep(196621,[&]{return iwm_phy_ctxt_cmd(sc, &sc->sc_phyctxt[i], 1, 1,
+                               IWM_FW_CTXT_ACTION_ADD, 0);});
         if (err) {
             XYLog("%s: could not add phy context %d (error %d)\n",
                   DEVNAME(sc), i, err);
@@ -3459,19 +3801,19 @@ iwm_init_hw(struct iwm_softc *sc)
         iwm_tt_tx_backoff(sc, 0);
     
     
-    err = iwm_config_ltr(sc);
+    err = awdlIbssInitStep(196622,[&]{return iwm_config_ltr(sc);});
     if (err) {
         XYLog("%s: PCIe LTR configuration failed (error %d)\n",
               DEVNAME(sc), err);
     }
     
     if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_CT_KILL_BY_FW)) {
-        err = iwm_send_temp_report_ths_cmd(sc);
+        err = awdlIbssInitStep(196623,[&]{return iwm_send_temp_report_ths_cmd(sc);});
         if (err)
             goto err;
     }
     
-    err = iwm_power_update_device(sc);
+    err = awdlIbssInitStep(196624,[&]{return iwm_power_update_device(sc);});
     if (err) {
         XYLog("%s: could not send power command (error %d)\n",
               DEVNAME(sc), err);
@@ -3479,7 +3821,7 @@ iwm_init_hw(struct iwm_softc *sc)
     }
     
     if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_LAR_SUPPORT)) {
-        err = iwm_send_update_mcc_cmd(sc, "ZZ");
+        err = awdlIbssInitStep(196625,[&]{return iwm_send_update_mcc_cmd(sc, "ZZ");});
         if (err) {
             XYLog("%s: could not init LAR (error %d)\n",
                   DEVNAME(sc), err);
@@ -3488,7 +3830,7 @@ iwm_init_hw(struct iwm_softc *sc)
     }
     
     if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_UMAC_SCAN)) {
-        err = iwm_config_umac_scan(sc);
+        err = awdlIbssInitStep(196626,[&]{return iwm_config_umac_scan(sc);});
         if (err) {
             XYLog("%s: could not configure scan (error %d)\n",
                   DEVNAME(sc), err);
@@ -3501,8 +3843,8 @@ iwm_init_hw(struct iwm_softc *sc)
             qid = IWM_DQA_INJECT_MONITOR_QUEUE;
         else
             qid = IWM_AUX_QUEUE;
-        err = iwm_enable_txq(sc, IWM_MONITOR_STA_ID, qid,
-                             iwm_ac_to_tx_fifo[EDCA_AC_BE], 0, IWM_MAX_TID_COUNT, 0);
+        err = awdlIbssInitStep(196627,[&]{return iwm_enable_txq(sc, IWM_MONITOR_STA_ID, qid,
+                             iwm_ac_to_tx_fifo[EDCA_AC_BE], 0, IWM_MAX_TID_COUNT, 0);});
         if (err) {
             XYLog("%s: could not enable monitor inject Tx queue "
                   "(error %d)\n", DEVNAME(sc), err);
@@ -3515,8 +3857,8 @@ iwm_init_hw(struct iwm_softc *sc)
                 qid = ac + IWM_DQA_MIN_MGMT_QUEUE;
             else
                 qid = ac;
-            err = iwm_enable_txq(sc, IWM_STATION_ID, qid,
-                                 iwm_ac_to_tx_fifo[ac], 0, IWM_TID_NON_QOS, 0);
+            err = awdlIbssInitStep(196628,[&]{return iwm_enable_txq(sc, IWM_STATION_ID, qid,
+                                 iwm_ac_to_tx_fifo[ac], 0, IWM_TID_NON_QOS, 0);});
             if (err) {
                 XYLog("%s: could not enable Tx queue %d "
                       "(error %d)\n", DEVNAME(sc), ac, err);
@@ -3525,7 +3867,7 @@ iwm_init_hw(struct iwm_softc *sc)
         }
     }
     
-    err = iwm_disable_beacon_filter(sc);
+    err = awdlIbssInitStep(196629,[&]{return iwm_disable_beacon_filter(sc);});
     if (err) {
         XYLog("%s: could not disable beacon filter (error %d)\n",
               DEVNAME(sc), err);
@@ -3540,6 +3882,13 @@ err:
 int ItlIwm::
 iwm_init(struct _ifnet *ifp)
 {
+#ifdef AIRPORT_WCL
+    awdlIbssLifecycleSource(ItlIbss::LifeCode::InitEnter);
+#endif
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
     XYLog("%s\n", __FUNCTION__);
     struct iwm_softc *sc = (struct iwm_softc*)ifp->if_softc;
     struct ieee80211com *ic = &sc->sc_ic;
@@ -3552,6 +3901,9 @@ iwm_init(struct _ifnet *ifp)
     memset(sc->sc_tx_ba, 0, sizeof(sc->sc_tx_ba));
     
     generation = ++sc->sc_generation;
+#ifdef AIRPORT_WCL
+    awdlIbssLifecycleSource(ItlIbss::LifeCode::InitAdvanced);
+#endif
     
     KASSERT(sc->task_refs.refs == 0, "sc->task_refs.refs == 0");
     //        refcnt_init(&sc->task_refs);
@@ -3618,6 +3970,10 @@ _iwm_start_task(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3
     struct ether_header *eh;
     mbuf_t m;
     int ac = EDCA_AC_BE; /* XXX */
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return kIOReturnOutputDropped;
+#endif
     
     if (!(ifp->if_flags & IFF_RUNNING) || ifq_is_oactive(&ifp->if_snd) ||
         (sc->sc_flags & IWM_FLAG_SHUTDOWN) ||
@@ -3714,6 +4070,9 @@ iwm_stop(struct _ifnet *ifp)
     
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
+#ifdef AIRPORT_WCL
+    awdlIbssLifecycleSource(ItlIbss::LifeCode::StopEnter);
+#endif
     sc->sc_flags |= IWM_FLAG_SHUTDOWN; /* Disallow new tasks. */
     
     /* Cancel scheduled tasks and let any stale tasks finish up. */
@@ -3730,6 +4089,9 @@ iwm_stop(struct _ifnet *ifp)
     /* Reset soft state. */
     
     sc->sc_generation++;
+#ifdef AIRPORT_WCL
+    awdlIbssLifecycleSource(ItlIbss::LifeCode::StopAdvanced);
+#endif
     for (i = 0; i < nitems(sc->sc_cmd_resp_pkt); i++) {
         ::free(sc->sc_cmd_resp_pkt[i]);
         sc->sc_cmd_resp_pkt[i] = NULL;
@@ -3789,6 +4151,11 @@ iwm_watchdog(struct _ifnet *ifp)
 {
     struct iwm_softc *sc = (struct iwm_softc *)ifp->if_softc;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    // IBSS polling runs on its worker; never sleep on this workloop callback.
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return;
+#endif
     int i;
     
     ifp->if_timer = 0;
@@ -3801,6 +4168,9 @@ iwm_watchdog(struct _ifnet *ifp)
     for (i = 0; i < nitems(sc->sc_tx_timer); i++) {
         if (sc->sc_tx_timer[i] > 0) {
             if (--sc->sc_tx_timer[i] == 0) {
+#ifdef AIRPORT_WCL
+                that->awdlIbssLifecycleSource(ItlIbss::LifeCode::WatchdogReset,uint32_t(i));
+#endif
                 XYLog("%s: device timeout\n", DEVNAME(sc));
 #ifdef IWM_DEBUG
                 that->iwm_nic_error(sc);
@@ -3966,16 +4336,26 @@ iwm_nic_umac_error(struct iwm_softc *sc)
     base = sc->sc_uc.uc_umac_error_event_table;
     
     if (base < 0x800000) {
+#ifdef AIRPORT_WCL
+        awdlIbssFirmwareFault(1,ItlIbss::FaultRead::InvalidPointer,{});
+#endif
         XYLog("%s: Invalid error log pointer 0x%08x\n",
               DEVNAME(sc), base);
         return;
     }
     
     if (iwm_read_mem(sc, base, &table, sizeof(table)/sizeof(uint32_t))) {
+#ifdef AIRPORT_WCL
+        awdlIbssFirmwareFault(1,ItlIbss::FaultRead::ReadFailed,{});
+#endif
         XYLog("%s: reading errlog failed\n", DEVNAME(sc));
         return;
     }
     
+#ifdef AIRPORT_WCL
+    ItlIbss::FaultSnapshot fault{table.valid,table.error_id,table.data1,table.data2,table.data3,table.cmd_header,0,table.umac_major,table.umac_minor};
+    awdlIbssFirmwareFault(1,table.valid?ItlIbss::FaultRead::Valid:ItlIbss::FaultRead::Empty,fault);
+#endif
     if (ERROR_START_OFFSET <= table.valid * ERROR_ELEM_SIZE) {
         XYLog("%s: Start UMAC Error Log Dump:\n", DEVNAME(sc));
         XYLog("%s: Status: 0x%x, count: %d\n", DEVNAME(sc),
@@ -4059,16 +4439,26 @@ iwm_nic_error(struct iwm_softc *sc)
     XYLog("%s: dumping device error log\n", DEVNAME(sc));
     base = sc->sc_uc.uc_error_event_table;
     if (base < 0x800000) {
+#ifdef AIRPORT_WCL
+        awdlIbssFirmwareFault(0,ItlIbss::FaultRead::InvalidPointer,{});
+#endif
         XYLog("%s: Invalid error log pointer 0x%08x\n",
               DEVNAME(sc), base);
         return;
     }
     
     if (iwm_read_mem(sc, base, &table, sizeof(table)/sizeof(uint32_t))) {
+#ifdef AIRPORT_WCL
+        awdlIbssFirmwareFault(0,ItlIbss::FaultRead::ReadFailed,{});
+#endif
         XYLog("%s: reading errlog failed\n", DEVNAME(sc));
         return;
     }
     
+#ifdef AIRPORT_WCL
+    ItlIbss::FaultSnapshot fault{table.valid,table.error_id,table.data1,table.data2,table.data3,table.hcmd,table.last_cmd_id,table.major,table.minor};
+    awdlIbssFirmwareFault(0,table.valid?ItlIbss::FaultRead::Valid:ItlIbss::FaultRead::Empty,fault);
+#endif
     if (!table.valid) {
         XYLog("%s: errlog not found, skipping\n", DEVNAME(sc));
         return;
@@ -4220,6 +4610,10 @@ iwm_intr(OSObject *arg, IOInterruptEventSource* sender, int count)
     handled |= (r1 & (IWM_CSR_INT_BIT_ALIVE /*| IWM_CSR_INT_BIT_SCD*/));
     
     if (r1 & IWM_CSR_INT_BIT_RF_KILL) {
+#ifdef AIRPORT_WCL
+        ItlIbss::requestExclusiveReset(that->awdlIbssExclusive);
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqRfKill);
+#endif
         handled |= IWM_CSR_INT_BIT_RF_KILL;
         XYLog("%s RF_KILL has been toggled\n", __FUNCTION__);
         that->iwm_check_rfkill(sc);
@@ -4229,6 +4623,10 @@ iwm_intr(OSObject *arg, IOInterruptEventSource* sender, int count)
     }
     
     if (r1 & IWM_CSR_INT_BIT_SW_ERR) {
+#ifdef AIRPORT_WCL
+        ItlIbss::requestExclusiveReset(that->awdlIbssExclusive);
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqSwError);
+#endif
 #ifdef IWM_DEBUG
         int i;
         
@@ -4256,6 +4654,10 @@ iwm_intr(OSObject *arg, IOInterruptEventSource* sender, int count)
     }
     
     if (r1 & IWM_CSR_INT_BIT_HW_ERR) {
+#ifdef AIRPORT_WCL
+        ItlIbss::requestExclusiveReset(that->awdlIbssExclusive);
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqHwError);
+#endif
         handled |= IWM_CSR_INT_BIT_HW_ERR;
         XYLog("%s: hardware error, stopping device \n", DEVNAME(sc));
         if ((sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0) {
@@ -4340,6 +4742,11 @@ iwm_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count)
     if ((inta_fh & IWM_MSIX_FH_INT_CAUSES_FH_ERR) ||
         (inta_hw & IWM_MSIX_HW_INT_CAUSES_REG_SW_ERR) ||
         (inta_hw & IWM_MSIX_HW_INT_CAUSES_REG_SW_ERR_V2)) {
+#ifdef AIRPORT_WCL
+        ItlIbss::requestExclusiveReset(that->awdlIbssExclusive);
+        if(inta_fh & IWM_MSIX_FH_INT_CAUSES_FH_ERR)that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqDmaError);
+        if(inta_hw & (IWM_MSIX_HW_INT_CAUSES_REG_SW_ERR|IWM_MSIX_HW_INT_CAUSES_REG_SW_ERR_V2))that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqSwError);
+#endif
 #ifdef IWM_DEBUG
         int i;
         
@@ -4365,11 +4772,19 @@ iwm_intr_msix(OSObject *object, IOInterruptEventSource* sender, int count)
     }
     
     if (inta_hw & IWM_MSIX_HW_INT_CAUSES_REG_RF_KILL) {
+#ifdef AIRPORT_WCL
+        ItlIbss::requestExclusiveReset(that->awdlIbssExclusive);
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqRfKill);
+#endif
         that->iwm_check_rfkill(sc);
         task_add(systq, &sc->init_task);
     }
     
     if (inta_hw & IWM_MSIX_HW_INT_CAUSES_REG_HW_ERR) {
+#ifdef AIRPORT_WCL
+        ItlIbss::requestExclusiveReset(that->awdlIbssExclusive);
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::IrqHwError);
+#endif
         XYLog("%s: hardware error, stopping device \n", DEVNAME(sc));
         if ((sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0) {
             sc->sc_flags |= IWM_FLAG_HW_ERR;
@@ -5033,6 +5448,15 @@ iwm_init_task(void *arg1)
     XYLog("%s\n", __FUNCTION__);
     struct iwm_softc *sc = (struct iwm_softc *)arg1;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    that->awdlIbssLifecycleSource(ItlIbss::LifeCode::InitTaskEnter);
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) {
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::InitTaskDenied);
+        that->awdlIbssExclusive.resetRequested = true;
+        return;
+    }
+#endif
     struct _ifnet *ifp = &sc->sc_ic.ic_if;
     int s = splnet();
     int generation = sc->sc_generation;
@@ -5060,6 +5484,7 @@ iwm_init_task(void *arg1)
             XYLog("WCL: retrying firmware initialization after timeout\n");
             error = that->iwm_init(ifp);
         }
+        that->awdlIbssLifecycleSource(ItlIbss::LifeCode::InitTaskResult,uint32_t(error));
         if (error && !(ifp->if_flags & IFF_RUNNING)) {
             sc->sc_ic.ic_wcl_mac_reconfig = false;
             ifp->if_flags &= ~IFF_UP;
@@ -5081,6 +5506,10 @@ iwm_mac_ctxt_task(void *arg)
 {
     struct iwm_softc *sc = (struct iwm_softc *)arg;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return;
+#endif
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
     int err, s = splnet();
@@ -5110,6 +5539,10 @@ iwm_chan_ctxt_task(void *arg)
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return;
+#endif
     int err, s = splnet();
     
     if (sc->sc_flags & IWM_FLAG_SHUTDOWN ||
@@ -5143,6 +5576,10 @@ iwm_ba_task(void *arg)
 {
     struct iwm_softc *sc = (struct iwm_softc *)arg;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return;
+#endif
     struct ieee80211com *ic = &sc->sc_ic;
     struct ieee80211_node *ni = ic->ic_bss;
     int s = splnet();
@@ -5205,12 +5642,11 @@ iwm_ba_task(void *arg)
             ba->ba_bitmap = 0;
             if (!that->iwm_sta_tx_agg(sc, ni, tid, 0, ssn, 1)) {
                 ieee80211_addba_resp_accept(ic, ni, tid);
-                sc->lq_sta.rs_drv.lq.agg_frame_cnt_limit = LINK_QUAL_AGG_FRAME_LIMIT_DEF;
 
                 XYLog("Tx aggregation enabled on ra = %s tid = %d\n",
                          ether_sprintf(ni->ni_macaddr), tid);
 
-                iwl_mvm_send_lq_cmd(sc, &sc->lq_sta.rs_drv.lq);
+                iwl_mvm_rs_set_agg_limit(sc, LINK_QUAL_AGG_FRAME_LIMIT_DEF);
             } else {
             out:
                 ieee80211_addba_resp_refuse(ic, ni, tid,

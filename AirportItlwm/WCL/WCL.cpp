@@ -10,6 +10,7 @@
 #include "../AirportItlwmV2.hpp"
 #include "../AirportItlwmSkywalkInterface.hpp"
 #include <kern/thread_call.h>
+#include <libkern/OSAtomic.h>
 #include <kern/clock.h>
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
@@ -906,7 +907,9 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_LOW_LATENCY_INFO(apple80211_low_la
 {
     if (!data)
         return kIOReturnBadArgument;
-    // No low-latency or P2P session is implemented by this adapter.
+    // Preserve the existing zero-session response, and make this boundary observable.
+    static volatile SInt32 queryCount = 0;
+    setProperty("AWDLTraceLowLatencyInfoCalls", static_cast<unsigned long long>(static_cast<uint32_t>(OSIncrementAtomic(&queryCount)) + 1), 32);
     bzero(data, 4);
     return kIOReturnSuccess;
 }

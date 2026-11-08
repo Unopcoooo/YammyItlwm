@@ -15,8 +15,23 @@
 #ifndef ItlIwm_hpp
 #define ItlIwm_hpp
 
+#include "../awdl/NativeSearchOwner.hpp"
+#include "../awdl/NativeSearchControlTx.hpp"
+#include "../awdl/NativeDiscoverySession.hpp"
 #include <compat.h>
 #include "itlhdr.h"
+#ifdef AIRPORT_WCL
+#include "../awdl/ProbeCounters.hpp"
+#include "../awdl/AuxRoc.hpp"
+#include "../awdl/AuxTx.hpp"
+#include "../awdl/SingleDataProbe.hpp"
+#include "../awdl/IbssIwmCommands.hpp"
+#include "../awdl/IbssExclusive.hpp"
+#include "../awdl/IbssLifecycleTrace.hpp"
+#include "../awdl/BatchPolicy.hpp"
+#include "../awdl/DiscoveryPolicy.hpp"
+#include <IOKit/IOTimerEventSource.h>
+#endif
 #include <linux/kernel.h>
 
 #include <IOKit/IOWorkLoop.h>
@@ -33,14 +48,242 @@
 #include <HAL/ItlDriverInfo.hpp>
 #include <HAL/ItlDriverController.hpp>
 
+struct ItlIbssTxPort;
+struct ItlIbssPeerPort;
+namespace ItlIbss {struct PeerGrant;}
 class ItlIwm : public ItlHalService, ItlDriverInfo, ItlDriverController {
     OSDeclareDefaultStructors(ItlIwm)
     
 public:
+#ifdef AIRPORT_WCL
+    // Observe only; initialized before interrupts, accessed on the RX workloop.
+    ItlAwdlProbeCounters *awdlProbeCounters = nullptr;
+    bool awdlDataContext(ItlAwdl::DataContext &out);
+    bool awdlIbssNativeContext(ItlAwdl::DataContext &out,bool preparing=false);
+    uint32_t awdlIbssNativeLeaseReason();
+    int awdlIbssNativeOfferBsd(const uint8_t *,size_t);
+    bool awdlIbssNativeOpen(const uint8_t current[6]);
+    IOReturn awdlIbssNativeRequest(const ItlAwdl::SingleDataRequest &,const uint8_t current[6]);
+    void awdlIbssNativeQueuesStop();
+    void awdlIbssNativeWake();
+    bool awdlIbssLocalAddress(uint8_t out[6]);
+    bool awdlIbssNativeStartIdle();
+    bool awdlIbssNativePending();
+    void awdlIbssNativeQuiesce();
+    bool awdlProbeEnabled = false;
+    bool awdlMgmtFilterEnabled = false;
+    bool awdlProbeRxSeen = false;
+    uint32_t awdlProbeLogged = 0;
+    void observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2);
+    ItlIbss::ExclusiveState awdlIbssExclusive;
+    ItlIbss::OneShot awdlIbssOneShot;
+    ItlIbss::BatchControl awdlBatch;
+    friend struct ItlIbssTxPort;
+    friend struct ItlListenerTxPort;
+    ItlIbssTxPort *awdlIbssTxPort=nullptr;
+    friend struct ItlIbssPeerPort;
+    bool awdlIbssPeerActive();
+    bool awdlIbssPeerSubmit();
+    IOReturn awdlIbssDataRequest(const ItlAwdl::SingleDataRequest &,bool cancel,unsigned mode=0,bool nativeRequest=false);
+    void awdlIbssScheduledTick();
+    bool awdlIbssDataActive();
+    bool awdlListenerActive();
+    bool awdlIbssReceiveOnlyActive();
+    IOReturn awdlIbssReceiveOnlyRequest(const ItlAwdl::SingleDataRequest &);
+    bool awdlListenerQueueReady();
+    bool awdlListenerReserveQueue();
+    IOReturn awdlListenerRequest(const ItlAwdl::SingleDataRequest &);
+    IOReturn awdlIbssEchoRequest(const ItlAwdl::SingleDataRequest &,unsigned,unsigned);
+    bool awdlListenerTxActive();
+    bool awdlListenerTxWindowValid();
+    void awdlListenerTxTick();
+    int awdlListenerTxComplete(unsigned,unsigned,uint32_t);
+    void awdlListenerTxResponse(unsigned,unsigned,const void *,size_t);
+    void awdlListenerTxCancel();
+    void awdlListenerTxStopped();
+    IOReturn awdlListenerTxRequest(const ItlAwdl::SingleDataRequest &);
+    IOReturn awdlListenerPairRequest(const ItlAwdl::SingleDataRequest &,const uint8_t *,const uint8_t *);
+    bool awdlIbssDataMayTransmit(const ItlIbss::PeerGrant &);
+    void awdlIbssDataTick();
+    void awdlIbssDataWindow();
+    void awdlIbssDataPublish();
+    void awdlIbssDataPortResult(bool stopped);
+    bool awdlIbssPeerPrepare(const uint8_t *,size_t);
+    bool awdlIbssPeerTxComplete(unsigned,unsigned,const void *,size_t);
+    bool awdlIbssManagementDrained();
+    bool awdlIbssIdentityWindowValid();
+    int awdlIbssDataIdentity(bool);
+    void awdlIbssPeerTick();
+    void awdlIbssPeerCancel();
+    void awdlIbssPeerStopped();
+    int awdlIbssTxProbeOnce();
+    bool awdlIbssTxStart(const uint8_t *,size_t);
+    int awdlIbssTxComplete(unsigned,unsigned,uint32_t);
+    void awdlIbssTxTick();
+    void awdlIbssTxCancel();
+    void awdlIbssTxStopped();
+    void awdlIbssTxDispose();
+    IOReturn awdlBatchRequest(uint32_t command,uint32_t run,uint32_t mode);
+    void awdlBatchPoll();
+    void awdlBatchPublish();
+
+    IOTimerEventSource *awdlIbssTimer = nullptr;
+    bool awdlIbssWorkPending = false;
+    uint64_t awdlIbssWorkerEpoch = 0;
+    ItlAwdl::NativeSearchOwner awdlNativeSearch;
+    ItlAwdl::NativeSearchControlTx awdlNativeControlTx;
+    ItlAwdl::NativeDiscoverySession awdlNativeDiscovery;
+    bool awdlNativeDiscoveryReady();
+    bool awdlNativeDiscoveryOpen(OSObject *owner,uint64_t epoch);
+    int awdlNativeDiscoveryOffer(OSObject *owner,const uint8_t *,size_t);
+    void awdlNativeDiscoveryStop();
+    void awdlNativeDiscoveryTick();
+    void awdlNativeDiscoveryReceive(const uint8_t *,size_t,unsigned channel,uint32_t gp2);
+    void awdlNativeDiscoveryPublish();
+    bool awdlNativeControlReadable(IOWorkLoop *loop){
+#ifdef AIRPORT_VTD
+        return loop&&getMainWorkLoop()==loop&&loop->inGate()&&!dmaDetaching;
+#else
+        return false;
+#endif
+    }
+    bool awdlNativeSearchReserved();
+    bool awdlNativeSearchMayConfigure();
+    bool awdlNativeSearchConsumeRx();
+    bool awdlNativeSearchAddress(uint8_t out[6]);
+    IOReturn awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch=0,bool receiveValidation=false);
+    void awdlNativeSearchTick(uint64_t epoch);
+    void awdlNativeSearchPublish();
+    IOReturn awdlNativeSearchEnable();
+    bool awdlNativeSearchEnabled();
+    bool awdlNativeSearchMasterChannel(uint32_t &channel);
+    void awdlNativeSyncStatePreflight(const void *payload,unsigned length);
+    IOReturn awdlNativeSyncParams(void *payload,unsigned length,OSObject *owner,bool set);
+    IOReturn awdlNativeStartMaster(OSObject *owner,uint32_t period,bool warmParams=false);
+    bool awdlNativeSyncRoleReady();
+    bool awdlNativeSyncRoleConfirmed();
+    IOReturn awdlNativeSyncRole(void *payload,unsigned length,OSObject *owner,bool set);
+    IOReturn awdlNativeControlTxArm(uint64_t epoch,bool periodic=false);
+    void awdlNativeControlTxTick();
+    void awdlNativeControlTxStop(unsigned reason);
+    void awdlNativeControlTxPublish();
+    IOReturn awdlNativeSearchReadMasterChannel(uint32_t &channel,bool &reserved);
+    void *awdlIbssWorkerPrepare();
+    bool awdlIbssWorkerSubmit(void *);
+    void awdlIbssWorkerDiscard(void *);
+    static void awdlIbssExperimentWorker(void *,void *);
+    void awdlIbssExperimentPublish();
+    void awdlIbssStaRecoveryObserve();
+    void awdlIbssLifecycleSource(ItlIbss::LifeCode,uint32_t detail=0);
+    void awdlIbssPassiveTraceStart();
+    // AWDL resource observation only; native command behavior is unchanged.
+    uint32_t awdlP2pResourceSubmit(uint32_t,uint32_t,uint16_t,const void *,bool);
+    void awdlP2pResourceReturn(uint32_t,uint32_t,uint32_t,int,bool,uint32_t);
+    void awdlIbssFirmwareFault(uint32_t,ItlIbss::FaultRead,const ItlIbss::FaultSnapshot &);
+    int tsleep_nsec(void *,int,const char *,int);
+    void wakeupOn(void *);
+    template<class F> int awdlIbssInitStep(unsigned code,F operation) {
+        awdlIbssExperimentEvent(11,code,0,0,0);
+        int error=operation();awdlIbssExperimentEvent(12,code,error,0,0);return error;
+    }
+    void awdlIbssExperimentTick();
+    void awdlIbssExperimentEvent(unsigned,unsigned,int,unsigned,unsigned);
+    void awdlIbssExperimentWire(const void *,size_t,bool);
+    void awdlIbssDataRxStage(unsigned,const ItlAwdl::RawRxMetadata &);
+    void awdlIbssExperimentCommon(mbuf_t,int,uint32_t,uint32_t);
+    void awdlIbssExperimentBeacon(const void *,size_t);
+    IOReturn awdlIbssExperimentTimerPrepare();
+    void awdlIbssExperimentTimerStart();
+    void awdlIbssExperimentTimerStop();
+    static void awdlIbssExperimentTimerAction(OSObject *,IOTimerEventSource *);
+    friend struct ItlIbssExclusiveTransport;
+    int awdlIbssExclusiveBegin(uint64_t);
+    int awdlIbssExclusiveEnd();
+    int awdlIbssExclusivePoll();
+    int awdlIbssCandidateConfigure();
+    // Isolated candidate only; nonvirtual, explicit default-off experiment entry.
+    int awdlIbssCandidateCommand(ItlIbss::IwmSession &, ItlIbss::Action,
+                                const uint8_t *, size_t);
+
+    ItlAwdl::AuxRocSession awdlRocSession;
+    uint32_t awdlRocChannel = 0, awdlRocTicks = 0;
+    bool awdlRocAttempted = false, awdlRocCancelSent = false;
+    uint64_t awdlRocDeadlineNs = 0;
+    uint32_t awdlRocRecordedStarts = 0, awdlRocRecordedEnds = 0, awdlRocRecordedFailures = 0;
+    uint32_t awdlMasterChannel = 0; // software dwell policy; main work-loop gate
+    bool awdlEngineCycleAccounted = false;
+    IOReturn setAwdlMasterChannel(uint32_t channel) override;
+    void awdlEngineAccountCycle();
+    IOReturn awdlArmValidation();
+    void awdlRocTick();
+    void awdlRocNotify(const uint8_t *, size_t);
+    void awdlRocWindowReady();
+    void awdlRocCancel();
+    void awdlRocQuiesced();
+    void awdlRocPublish();
+    bool awdlPeerRocEnabled = false;
+    bool awdlPeerRocEngine = false;
+    bool awdlRawRxEnabled = false;
+    void awdlRawRxRecord(unsigned stage,const ItlAwdl::RawRxMetadata &metadata);
+    void awdlRawRxCommon(mbuf_t,int,uint32_t,uint32_t);
+    void awdlRawRxWire(unsigned,const void*,size_t,bool);
+    void awdlRxIngressEvent(unsigned,uint32_t,uint32_t);
+    bool awdlDiscoveryEnabled = false, awdlRocIsDiscovery = false;
+    bool awdlRxControlEnabled=false;
+    uint32_t awdlRxControlHomeChannel=0;
+    ItlAwdl::ReceiveWindow awdlRawRxWindow;
+    IOTimerEventSource *awdlDiscoveryTimer = nullptr;
+    ItlAwdl::DiscoveryPolicy awdlDiscoveryPolicy;
+    uint32_t awdlRocDurationTu=16, awdlRocHomeChannel=0;
+    uint32_t awdlRocRxFrames=0,awdlRocAwdlFrames=0,awdlRocBeaconFrames=0,awdlRocOffHomeFrames=0;
+    void awdlDiscoveryTimerStart();
+    void awdlDiscoveryTimerStop();
+    static void awdlDiscoveryTimerAction(OSObject *, IOTimerEventSource *);
+
+    uint32_t awdlPeerRocAttempts = 0, awdlPeerRocDelayTu = 0;
+    uint32_t awdlPeerRocRequestedGp2 = 0, awdlPeerRocResponseStatus = UINT32_MAX;
+    ItlAwdl::AuxRocCommand awdlPeerRocCommand = {};
+    void awdlPeerRocRecord(uint32_t kind, const uint8_t *notification = nullptr, size_t length = 0);
+    ItlAwdl::PeerRocPlan awdlPeerRocPlan;
+    bool awdlAuxTxEnabled = false;
+    bool awdlTemplateTxEnabled = false;
+    uint32_t awdlTemplateSequence = 0;
+    unsigned awdlScanSubmitting = 0; // protected by main work-loop gate
+    ItlAwdl::AuxTxOwnership awdlAuxTx;
+    IOReturn awdlArmSingleDataProbe(const ItlAwdl::SingleDataRequest &,const uint8_t local[6]);
+    bool awdlSingleDataProbeReady(uint32_t *epoch=nullptr);
+    void awdlSingleDataProbePublish();
+    void awdlAuxTxStart(bool dataOnly=false);
+    void awdlAuxTxTick();
+    bool awdlAuxTxDrain();
+    bool awdlAuxTxComplete(unsigned queue, unsigned index, uint32_t status);
+    void awdlAuxTxPublish();
+#endif
+    // Diagnostic only. The firmware revisits a channel once per scan visit; asking
+    // for more visits is the only dwell control this driver exposes. 0 keeps every
+    // scan byte-identical to the stock behaviour, and the boot argument that sets
+    // it is honoured only when the AWDL probe is enabled.
+    uint32_t awdlDwellIterations = 0;
+    uint16_t awdlScanIterations(int channel) const;
     //kext
     void free() override;
     virtual bool attach(IOPCIDevice *device) override;
     virtual void detach(IOPCIDevice *device) override;
+#ifdef AIRPORT_VTD
+    bool inRateControlGate() {
+        return getMainWorkLoop()->inGate();
+    }
+
+    template <typename Action>
+    IOReturn runRateControlAction(Action action) {
+        if (inRateControlGate())
+            return action();
+        return getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                return (*static_cast<Action *>(arg0))();
+            }, &action);
+    }
+#endif
     IOReturn enable(IONetworkInterface *netif) override;
     IOReturn disable(IONetworkInterface *netif) override;
     virtual struct ieee80211com *get80211Controller() override;
@@ -273,7 +516,7 @@ public:
                           struct iwm_rx_data *);
     void    iwm_ampdu_rate_control(struct iwm_softc *, struct ieee80211_node *, struct iwm_tx_ring *, uint16_t, uint16_t, struct ieee80211_tx_info *, int, uint32_t);
     void iwm_rx_mpdu_mq(struct iwm_softc *sc, mbuf_t m, void *pktdata,
-                   size_t maxlen, struct mbuf_list *ml);
+                   size_t maxlen, struct mbuf_list *ml, size_t diagnosticWireLength);
     void    iwm_rx_bmiss(struct iwm_softc *, struct iwm_rx_packet *,
                          struct iwm_rx_data *);
     int    iwm_binding_cmd(struct iwm_softc *, struct iwm_node *, uint32_t);
@@ -396,7 +639,7 @@ public:
     void    iwm_nic_umac_error(struct iwm_softc *);
 #endif
     void    iwm_rx_mpdu(struct iwm_softc *, mbuf_t, void *, size_t,
-                        struct mbuf_list *);
+                        struct mbuf_list *, size_t diagnosticWireLength);
     void   iwm_flip_address(uint8_t *);
     int    iwm_detect_duplicate(struct iwm_softc *, mbuf_t,
                struct iwm_rx_mpdu_desc *, struct ieee80211_rxinfo *);

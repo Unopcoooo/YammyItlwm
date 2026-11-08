@@ -121,6 +121,10 @@
 
 #include "ItlIwm.hpp"
 #include <net80211/ieee80211_priv.h>
+#ifdef AIRPORT_WCL
+#include "../awdl/RxIngressDiagnostics.hpp"
+static_assert(IWM_REPLY_RX_MPDU_CMD==ItlIbss::RxIngressDiagnostics::MpduCode,"RX MPDU code ABI");
+#endif
 
 void ItlIwm::
 iwm_disable_rx_dma(struct iwm_softc *sc)
@@ -350,7 +354,7 @@ iwm_rx_rx_phy_cmd(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 
 void ItlIwm::
 iwm_rx_mpdu(struct iwm_softc *sc, mbuf_t m, void *pktdata,
-            size_t maxlen, struct mbuf_list *ml)
+            size_t maxlen, struct mbuf_list *ml, size_t diagnosticWireLength)
 {
     struct ieee80211com *ic = &sc->sc_ic;
     struct ieee80211_rxinfo rxi;
@@ -368,28 +372,47 @@ iwm_rx_mpdu(struct iwm_softc *sc, mbuf_t m, void *pktdata,
     
     phy_info = &sc->sc_last_phy_info;
     rx_res = (struct iwm_rx_mpdu_res_start *)pktdata;
+#ifdef AIRPORT_WCL
+    ItlAwdl::RawRxMetadata diagnostic;
+    if(awdlRawRxEnabled || awdlIbssDataActive()) {
+        diagnostic=ItlAwdl::decodeRawRx(pktdata,diagnosticWireLength,false,
+            le16toh(phy_info->channel),le32toh(phy_info->system_timestamp));
+    }
+#endif
     len = le16toh(rx_res->byte_count);
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         /* Allow control frames in monitor mode. */
         if (len < sizeof(struct ieee80211_frame_cts)) {
+#ifdef AIRPORT_WCL
+            awdlRawRxRecord(ItlAwdl::RejectLength,diagnostic);
+#endif
             ic->ic_stats.is_rx_tooshort++;
             IC2IFP(ic)->netStat->inputErrors++;
             mbuf_freem(m);
             return;
         }
     } else if (len < sizeof(struct ieee80211_frame)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectLength,diagnostic);
+#endif
         ic->ic_stats.is_rx_tooshort++;
         IC2IFP(ic)->netStat->inputErrors++;
         mbuf_freem(m);
         return;
     }
     if (len > maxlen - sizeof(*rx_res)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectLength,diagnostic);
+#endif
         IC2IFP(ic)->netStat->inputErrors++;
         mbuf_freem(m);
         return;
     }
     
     if (phy_info->cfg_phy_cnt > 20) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectPhy,diagnostic);
+#endif
         mbuf_freem(m);
         return;
     }
@@ -397,6 +420,9 @@ iwm_rx_mpdu(struct iwm_softc *sc, mbuf_t m, void *pktdata,
     rx_pkt_status = le32toh(*(uint32_t *)((uint8_t*)pktdata + sizeof(*rx_res) + len));
     if (!(rx_pkt_status & IWM_RX_MPDU_RES_STATUS_CRC_OK) ||
         !(rx_pkt_status & IWM_RX_MPDU_RES_STATUS_OVERRUN_OK)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectCrc,diagnostic);
+#endif
         mbuf_freem(m);
         return; /* drop */
     }
@@ -408,6 +434,9 @@ iwm_rx_mpdu(struct iwm_softc *sc, mbuf_t m, void *pktdata,
     mbuf_setlen(m, len);
     
     if (iwm_rx_hwdecrypt(sc, m, rx_pkt_status, &rxi)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectDecrypt,diagnostic);
+#endif
         mbuf_freem(m);
         return;
     }
@@ -822,7 +851,7 @@ drop:
 
 void ItlIwm::
 iwm_rx_mpdu_mq(struct iwm_softc *sc, mbuf_t m, void *pktdata,
-               size_t maxlen, struct mbuf_list *ml)
+               size_t maxlen, struct mbuf_list *ml, size_t diagnosticWireLength)
 {
     struct ieee80211com *ic = &sc->sc_ic;
     struct ieee80211_rxinfo rxi;
@@ -837,9 +866,18 @@ iwm_rx_mpdu_mq(struct iwm_softc *sc, mbuf_t m, void *pktdata,
     memset(&rx_status, 0, sizeof(struct ieee80211_rx_status));
     
     desc = (struct iwm_rx_mpdu_desc *)pktdata;
+#ifdef AIRPORT_WCL
+    ItlAwdl::RawRxMetadata diagnostic;
+    if(awdlRawRxEnabled || awdlIbssDataActive()) {
+        diagnostic=ItlAwdl::decodeRawRx(pktdata,diagnosticWireLength,true);
+    }
+#endif
     
     if (!(desc->status & htole16(IWM_RX_MPDU_RES_STATUS_CRC_OK)) ||
         !(desc->status & htole16(IWM_RX_MPDU_RES_STATUS_OVERRUN_OK))) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectCrc,diagnostic);
+#endif
         mbuf_freem(m);
         return; /* drop */
     }
@@ -848,18 +886,27 @@ iwm_rx_mpdu_mq(struct iwm_softc *sc, mbuf_t m, void *pktdata,
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         /* Allow control frames in monitor mode. */
         if (len < sizeof(struct ieee80211_frame_cts)) {
+#ifdef AIRPORT_WCL
+            awdlRawRxRecord(ItlAwdl::RejectLength,diagnostic);
+#endif
             ic->ic_stats.is_rx_tooshort++;
             IC2IFP(ic)->netStat->inputErrors++;
             mbuf_freem(m);
             return;
         }
     } else if (len < sizeof(struct ieee80211_frame)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectLength,diagnostic);
+#endif
         ic->ic_stats.is_rx_tooshort++;
         IC2IFP(ic)->netStat->inputErrors++;
         mbuf_freem(m);
         return;
     }
     if (len > maxlen - sizeof(*desc)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectLength,diagnostic);
+#endif
         IC2IFP(ic)->netStat->inputErrors++;
         mbuf_freem(m);
         return;
@@ -941,11 +988,17 @@ iwm_rx_mpdu_mq(struct iwm_softc *sc, mbuf_t m, void *pktdata,
      * verified as part of the CCMP nonce.
      */
     if (iwm_rx_hwdecrypt(sc, m, le16toh(desc->status), &rxi)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectDecrypt,diagnostic);
+#endif
         mbuf_freem(m);
         return;
     }
     
     if (iwm_detect_duplicate(sc, m, desc, &rxi)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::RejectDuplicate,diagnostic);
+#endif
         mbuf_freem(m);
         return;
     }
@@ -966,8 +1019,12 @@ iwm_rx_mpdu_mq(struct iwm_softc *sc, mbuf_t m, void *pktdata,
     
     if (iwm_rx_reorder(sc, m, chanidx, desc,
                        (phy_info & IWM_RX_MPDU_PHY_SHORT_PREAMBLE),
-                       rate_n_flags, device_timestamp, &rxi, ml))
+                       rate_n_flags, device_timestamp, &rxi, ml)) {
+#ifdef AIRPORT_WCL
+        awdlRawRxRecord(ItlAwdl::ReorderConsumed,diagnostic);
+#endif
         return;
+    }
     
     iwm_rx_frame(sc, m, chanidx, le16toh(desc->status),
                  (phy_info & IWM_RX_MPDU_PHY_SHORT_PREAMBLE),
@@ -1006,7 +1063,13 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
     
     //    bus_dmamap_sync(sc->sc_dmat, data->map, 0, IWM_RBUF_SIZE,
     //        BUS_DMASYNC_POSTREAD);
+#ifdef AIRPORT_WCL
+    awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::BufferStart,0,0);
+#endif
     if (!bus_dmamap_read(data->map, data->m, IWM_RBUF_SIZE)) {
+#ifdef AIRPORT_WCL
+        awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::DmaFailure,0,IWM_RBUF_SIZE);
+#endif
         ifp->netStat->inputErrors++;
         return;
     }
@@ -1018,16 +1081,39 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
         
         code = IWM_WIDE_ID(pkt->hdr.flags, pkt->hdr.code);
         
-        if (!iwm_rx_pkt_valid(pkt))
+        if (!iwm_rx_pkt_valid(pkt)) {
+#ifdef AIRPORT_WCL
+            awdlRxIngressEvent(pkt->len_n_flags==htole32(IWM_FH_RSCSR_FRAME_INVALID)?
+                ItlIbss::RxIngressDiagnostics::SentinelHeader:ItlIbss::RxIngressDiagnostics::EmptyHeader,
+                offset,le32toh(pkt->len_n_flags));
+#endif
             break;
+        }
         
         len = sizeof(pkt->len_n_flags) + iwm_rx_packet_len(pkt);
-        if (len < minsz || len > (IWM_RBUF_SIZE - offset))
+        if (len < minsz || len > (IWM_RBUF_SIZE - offset)) {
+#ifdef AIRPORT_WCL
+            awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::InvalidLength,offset,len);
+#endif
             break;
+        }
+
+#ifdef AIRPORT_WCL
+        awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::Notification,offset,unsigned(code));
+#endif
         
+#ifdef AIRPORT_WCL
+        if(code==IWM_REPLY_RX_MPDU_CMD)
+            awdlIbssExperimentWire(pkt->data,iwm_rx_packet_payload_len(pkt),sc->sc_mqrx_supported);
+        if(code==IWM_REPLY_RX_MPDU_CMD)
+            awdlRawRxWire(ItlAwdl::RawIngress,pkt->data,iwm_rx_packet_payload_len(pkt),sc->sc_mqrx_supported);
+#endif
         if (code == IWM_REPLY_RX_MPDU_CMD && ++nmpdu == 1) {
             /* Take mbuf m0 off the RX ring. */
             if (iwm_rx_addbuf(sc, IWM_RBUF_SIZE, sc->rxq.cur)) {
+#ifdef AIRPORT_WCL
+                awdlRawRxWire(ItlAwdl::RejectBuffer,pkt->data,iwm_rx_packet_payload_len(pkt),sc->sc_mqrx_supported);
+#endif
                 ifp->netStat->inputErrors++;
                 break;
             }
@@ -1036,6 +1122,11 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
         }
         
         switch (code) {
+#ifdef AIRPORT_WCL
+            case IWM_BEACON_NOTIFICATION:
+                awdlIbssExperimentBeacon(pkt->data,iwm_rx_packet_payload_len(pkt));
+                break;
+#endif
             case IWM_REPLY_RX_PHY_CMD:
                 iwm_rx_rx_phy_cmd(sc, pkt, data);
                 break;
@@ -1048,15 +1139,22 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 ((uint8_t*)mbuf_data(m0) + nextoff);
                 if (nextoff + minsz >= IWM_RBUF_SIZE ||
                     !iwm_rx_pkt_valid(nextpkt)) {
+#ifdef AIRPORT_WCL
+                    if(nextoff+minsz>=IWM_RBUF_SIZE)
+                        awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::BufferEnd,nextoff,IWM_RBUF_SIZE);
+                    else awdlRxIngressEvent(nextpkt->len_n_flags==htole32(IWM_FH_RSCSR_FRAME_INVALID)?
+                        ItlIbss::RxIngressDiagnostics::SentinelHeader:ItlIbss::RxIngressDiagnostics::EmptyHeader,
+                        nextoff,le32toh(nextpkt->len_n_flags));
+#endif
                     /* No need to copy last frame in buffer. */
                     if (offset > 0)
                         mbuf_adj(m0, offset);
                     if (sc->sc_mqrx_supported)
                         iwm_rx_mpdu_mq(sc, m0, pkt->data,
-                                       maxlen, ml);
+                                       maxlen, ml, iwm_rx_packet_payload_len(pkt));
                     else
                         iwm_rx_mpdu(sc, m0, pkt->data,
-                                    maxlen, ml);
+                                    maxlen, ml, iwm_rx_packet_payload_len(pkt));
                     m0 = NULL; /* stack owns m0 now; abort loop */
                 } else {
                     /*
@@ -1067,6 +1165,9 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                     mbuf_copym(m0, 0, MBUF_COPYALL, MBUF_DONTWAIT, &m);
                     //                m = m_copym(m0, 0, M_COPYALL, M_DONTWAIT);
                     if (m == NULL) {
+#ifdef AIRPORT_WCL
+                        awdlRawRxWire(ItlAwdl::RejectBuffer,pkt->data,iwm_rx_packet_payload_len(pkt),sc->sc_mqrx_supported);
+#endif
                         ifp->netStat->inputErrors++;
                         mbuf_freem(m0);
                         m0 = NULL;
@@ -1075,10 +1176,10 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                     mbuf_adj(m, offset);
                     if (sc->sc_mqrx_supported)
                         iwm_rx_mpdu_mq(sc, m, pkt->data,
-                                       maxlen, ml);
+                                       maxlen, ml, iwm_rx_packet_payload_len(pkt));
                     else
                         iwm_rx_mpdu(sc, m, pkt->data,
-                                    maxlen, ml);
+                                    maxlen, ml, iwm_rx_packet_payload_len(pkt));
                 }
                 
                 break;
@@ -1158,7 +1259,9 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 SYNC_RESP_STRUCT(phy_db_notif, pkt, struct iwm_calib_res_notif_phy_db *);
                 iwm_phy_db_set_section(sc, phy_db_notif);
                 sc->sc_init_complete |= IWM_CALIB_COMPLETE;
-                //                wakeupOn(&sc->sc_init_complete);
+#ifdef AIRPORT_WCL
+                if(awdlIbssOneShot.armed && awdlIbssExclusive.operation) wakeupOn(&sc->sc_init_complete);
+#endif
                 break;
             }
                 
@@ -1196,6 +1299,7 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 break;
             }
                 
+            case IWM_BEACON_TEMPLATE_CMD:
             case IWM_ADD_STA_KEY:
             case IWM_PHY_CONFIGURATION_CMD:
             case IWM_TX_ANT_CONFIGURATION_CMD:
@@ -1223,6 +1327,7 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
             case IWM_REPLY_THERMAL_MNG_BACKOFF:
             case IWM_NVM_ACCESS_CMD:
             case IWM_MCC_UPDATE_CMD:
+            case IWM_HOT_SPOT_CMD:
             case IWM_TIME_EVENT_CMD: {
                 size_t pkt_len;
                 
@@ -1298,6 +1403,9 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 struct iwm_time_event_notif *notif;
                 uint32_t action;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwm_time_event_notif *);
+#ifdef AIRPORT_WCL
+                awdlRocNotify(pkt->data, iwm_rx_packet_payload_len(pkt));
+#endif
                 
                 if (sc->sc_time_event_uid != le32toh(notif->unique_id))
                     break;
@@ -1356,6 +1464,10 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
         
         offset += roundup(len, IWM_FH_RSCSR_FRAME_ALIGN);
     }
+#ifdef AIRPORT_WCL
+    if(m0 && offset+minsz>=IWM_RBUF_SIZE)
+        awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::BufferEnd,offset,IWM_RBUF_SIZE);
+#endif
     
     if (m0 && m0 != data->m && mbuf_type(m0) != MBUF_TYPE_FREE) {
         mbuf_freem(m0);

@@ -120,6 +120,9 @@
  */
 
 #include "ItlIwm.hpp"
+#ifdef AIRPORT_WCL
+#include "../awdl/MccChannelProfile.hpp"
+#endif
 
 void ItlIwm::
 iwm_free_tx_ring(iwm_softc *sc, struct iwm_tx_ring *ring)
@@ -465,6 +468,15 @@ iwm_send_update_mcc_cmd(struct iwm_softc *sc, const char *alpha2)
     int resp_v3 = isset(sc->sc_enabled_capa,
                         IWM_UCODE_TLV_CAPA_LAR_SUPPORT_V3);
     
+#ifdef AIRPORT_WCL
+    // AWDL read-only MCC snapshot invalidation; no change to the native request.
+    const auto awdlMccChubBefore=awdlProbeCounters?awdlProbeCounters->ibss.get(ItlIbss::ExperimentObservation::MccChubCount):0;
+    if(awdlProbeCounters) {
+        using D=ItlIbss::ExperimentObservation;auto &d=awdlProbeCounters->ibss;
+        d.set(D::MccDecoded,0);d.set(D::MccPresent,0);d.set(D::MccProfileVersion,1);
+        d.set(D::MccGeneration,uint32_t(sc->sc_generation));d.set(D::MccStatus,UINT32_MAX);
+    }
+#endif
     if (sc->sc_device_family == IWM_DEVICE_FAMILY_8000 &&
         !sc->sc_nvm.lar_enabled) {
         return 0;
@@ -523,6 +535,23 @@ iwm_send_update_mcc_cmd(struct iwm_softc *sc, const char *alpha2)
             goto out;
         }
     }
+#ifdef AIRPORT_WCL
+    // AWDL read-only MCC reply capture; the original error/result/map stay intact.
+    if(!err && awdlProbeCounters && pkt) {
+        static_assert(sizeof(iwm_mcc_update_resp_v1)==12 && sizeof(iwm_mcc_update_resp_v3)==16,"MCC reply ABI");
+        static_assert(offsetof(iwm_mcc_update_resp_v1,channels)==12 && offsetof(iwm_mcc_update_resp_v3,channels)==16,"MCC channel offset ABI");
+        const bool legacy=sc->sc_device_family==IWM_DEVICE_FAMILY_7000;
+        const auto map=legacy?iwm_nvm_channels:iwm_nvm_channels_8000;
+        const auto count=legacy?nitems(iwm_nvm_channels):nitems(iwm_nvm_channels_8000);
+        const auto view=ItlIbss::decodeMccChannelProfile(static_cast<const uint8_t*>(static_cast<const void*>(pkt->data)),
+            iwm_rx_packet_payload_len(pkt),resp_v3,map,count,uint32_t(sc->sc_generation));
+        using D=ItlIbss::ExperimentObservation;auto &d=awdlProbeCounters->ibss;
+        d.set(D::MccGeneration,view.generation);d.set(D::MccStatus,view.status);d.set(D::MccCountry,view.country);
+        d.set(D::MccSource,view.source);d.set(D::MccChannelCount,view.count);d.set(D::MccFlags6,view.flags6);
+        d.set(D::MccFlags44,view.flags44);d.set(D::MccFlags149,view.flags149);d.set(D::MccPresent,view.present);
+        d.set(D::MccDecoded,view.decoded && d.get(D::MccChubCount)==awdlMccChubBefore);
+    }
+#endif
 out:
     iwm_free_resp(sc, &hcmd);
     return err;

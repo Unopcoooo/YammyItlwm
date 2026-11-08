@@ -216,6 +216,7 @@ private: virtual void _abi_0dc0() __asm__("__ZN17IO80211Controller16CreatePostOf
     virtual void _RESERVEDIO80211Controller14();
     virtual void _RESERVEDIO80211Controller15();
     virtual IOReturn setMulticastList(ether_addr const*, unsigned int);
+    void setAwdlInterface(IO80211VirtualInterface *) __asm__("__ZN17IO80211Controller16setAwdlInterfaceEP23IO80211VirtualInterface");
 private: uint8_t _layout[0x128 - sizeof(IOEthernetController)];
 };
 static_assert(sizeof(IO80211Controller) == 0x128, "WCL ABI size");

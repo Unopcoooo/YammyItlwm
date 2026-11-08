@@ -21,6 +21,7 @@
 #include "IOKit/network/IOGatedOutputQueue.h"
 #include <libkern/c++/OSString.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOLib.h>
 #include <libkern/OSKextLib.h>
@@ -51,6 +52,8 @@ extern "C" {
 const char *convertApple80211IOCTLToString(signed int cmd);
 }
 
+struct ItlAwdlDataCall;
+struct ItlNativeControlJob;
 class AirportItlwm : public IO80211Controller {
     OSDeclareDefaultStructors(AirportItlwm)
 #define IOCTL(REQ_TYPE, REQ, DATA_TYPE) \
@@ -82,8 +85,31 @@ public:
     virtual IOService* probe(IOService* provider, SInt32* score) override;
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
+    IOReturn setProperties(OSObject *properties) override;
+    IOReturn awdlDataDispatch(ItlAwdlDataCall &call);
+    IOReturn awdlPublishNativeControlState();
+    bool willTerminate(IOService *provider,IOOptionBits options) override;
+    bool didTerminate(IOService *provider,IOOptionBits options,bool *defer) override;
+    bool awdlControlPrepare(uint64_t epoch);
+    bool awdlControlAllowsRole(OSObject *owner,uint64_t epoch,bool entering=true);
+    IOReturn awdlControlSubmitDiagnostic(uint64_t epoch);
+    uint64_t awdlControlNativeBegin(uint64_t epoch,bool up);
+    bool awdlControlNativeEnd(uint64_t epoch,uint64_t serial,bool linked=false);
+    bool awdlControlAllowsWarmParams(OSObject *owner,uint64_t epoch);
+    bool awdlControlComplete(uint64_t epoch,bool confirmedDown);
+    void awdlControlClose();
+    bool awdlControlHasJob();
+    bool awdlControlPermitsEnable();
+    bool awdlControlHasRunningJob();
+    bool awdlControlHandoffStop(IO80211VirtualInterface *interface);
+    bool awdlControlRetireStop();
+
     virtual IOReturn enable(IO80211SkywalkInterface *netif) AIRPORT_LEGACY_OVERRIDE;
     virtual IOReturn disable(IO80211SkywalkInterface *netif) AIRPORT_LEGACY_OVERRIDE;
+    // Probe49: count the family's virtual-interface enable bookkeeping so we can
+    // tell whether it ever asks this controller to enable our AWDL object.
+    virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *interface) override;
+    virtual SInt32 disableVirtualInterface(IO80211VirtualInterface *interface) override;
     virtual IOReturn setHardwareAddress(const void *addr, UInt32 addrBytes) override;
     virtual IOReturn getHardwareAddress(IOEthernetAddress* addrP) override;
     virtual IOReturn getPacketFilters(const OSSymbol *group, UInt32 *filters) const override;
@@ -161,11 +187,7 @@ public:
     void watchdogAction(IOTimerEventSource *timer);
     
     virtual SInt32 enableFeature(IO80211FeatureCode, void*) override;
-    virtual bool isCommandProhibited(int command) override {
-//        if (!ml_at_interrupt_context())
-//            XYLog("%s %s\n", __FUNCTION__, convertApple80211IOCTLToString(command));
-        return false;
-    };
+    virtual bool isCommandProhibited(int command) override;
     virtual SInt32 handleCardSpecific(IO80211SkywalkInterface *,unsigned long,void *,bool) override {
         XYLog("%s\n", __FUNCTION__);
         return 0;
@@ -261,6 +283,24 @@ public:
     bool magicPacketSupported;
     
     //AWDL
+    // The family's base implementation of this is unusable for this controller: it
+    // returns null even for its own AP role (measured in probe27), because a driver
+    // is expected to supply the concrete class. Supplying it here is what makes the
+    // family's virtual-interface machinery work at all.
+    IO80211VirtualInterface *createVirtualInterface(ether_addr *ether, UInt role) override;
+    // Set only when a request to create the AWDL virtual interface succeeds, so
+    // that a failed attempt leaves this null rather than a half-built interface.
+    // The older IO80211P2PInterface class does not exist in this kernel, so the
+    // modern base class is used.
+    IO80211VirtualInterface *fAWDLInterface = nullptr;
+    IOLock *fAwdlControlLock = nullptr;
+    ItlNativeControlJob *fAwdlControlJob = nullptr;
+    IOService *fAwdlControlDeferredProvider = nullptr;
+    IOOptionBits fAwdlControlDeferredOptions = 0;
+    bool fAwdlControlClosing = false;
+    bool fAwdlControlPhysicalStop = false;
+    uint64_t fAwdlControlLastTrialEpoch = 0;
+
     uint8_t *syncFrameTemplate;
     uint32_t syncFrameTemplateLength;
     uint8_t awdlBSSID[6];

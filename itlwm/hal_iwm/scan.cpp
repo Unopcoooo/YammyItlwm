@@ -162,6 +162,18 @@ iwm_scan_rate_n_flags(struct iwm_softc *sc, int flags, int no_cck)
         return htole32(IWL_RATE_6M_PLCP | tx_ant);
 }
 
+uint16_t ItlIwm::
+awdlScanIterations(int channel) const
+{
+    // Social channels only, and only when the diagnostic boot argument asked for
+    // it. Every other channel, and every scan when the option is absent, keeps the
+    // stock single visit.
+    if (awdlDwellIterations > 1 &&
+        (channel == 6 || channel == 44 || channel == 149))
+        return (uint16_t)awdlDwellIterations;
+    return 1;
+}
+
 uint8_t ItlIwm::
 iwm_lmac_scan_fill_channels(struct iwm_softc *sc,
                             struct iwm_scan_channel_cfg_lmac *chan, int n_ssids, int bgscan)
@@ -184,7 +196,7 @@ iwm_lmac_scan_fill_channels(struct iwm_softc *sc,
 #endif
         
         chan->channel_num = htole16(ieee80211_mhz2ieee(c->ic_freq, 0));
-        chan->iter_count = htole16(1);
+        chan->iter_count = htole16(awdlScanIterations(ieee80211_mhz2ieee(c->ic_freq, 0)));
         chan->iter_interval = 0;
         chan->flags = htole32(IWM_UNIFIED_SCAN_CHANNEL_PARTIAL);
 #ifdef AIRPORT_WCL
@@ -223,7 +235,7 @@ iwm_umac_scan_fill_channels(struct iwm_softc *sc,
 #endif
         
         chan->channel_num = ieee80211_mhz2ieee(c->ic_freq, 0);
-        chan->iter_count = 1;
+        chan->iter_count = (uint8_t)awdlScanIterations(ieee80211_mhz2ieee(c->ic_freq, 0));
         chan->iter_interval = htole16(0);
 #ifdef AIRPORT_WCL
         if (AirportWCL::probeChannel(n_ssids != 0,
@@ -362,6 +374,10 @@ iwm_fill_probe_req(struct iwm_softc *sc, struct iwm_scan_probe_req *preq)
 int ItlIwm::
 iwm_lmac_scan(struct iwm_softc *sc, int bgscan)
 {
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
     struct ieee80211com *ic = &sc->sc_ic;
     int scanSSIDLength = ic->ic_des_esslen;
     const uint8_t *scanSSID = ic->ic_des_essid;
@@ -632,6 +648,10 @@ iwm_get_scan_req_umac_data(struct iwm_softc *sc, struct iwm_scan_req_umac *req)
 int ItlIwm::
 iwm_umac_scan(struct iwm_softc *sc, int bgscan)
 {
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     int scanSSIDLength = ic->ic_des_esslen;
@@ -820,6 +840,17 @@ iwm_umac_scan(struct iwm_softc *sc, int bgscan)
 void ItlIwm::
 iwm_mcc_update(struct iwm_softc *sc, struct iwm_mcc_chub_notif *notif)
 {
+#ifdef AIRPORT_WCL
+    // AWDL invalidate a saved MCC permission when a real CHUB update arrives.
+    if(awdlProbeCounters) {
+        using D=ItlIbss::ExperimentObservation;auto &d=awdlProbeCounters->ibss;
+        d.set(D::MccDecoded,0);d.add(D::MccChubCount);
+        d.set(D::MccChubCountry,le16toh(notif->mcc));d.set(D::MccChubSource,notif->source_id);
+    }
+    // Revoke only the owned IBSS lease. Existing atomic quarantine blocks new
+    // exclusive commands; the existing bounded poll restores ordinary STA.
+    ItlIbss::requestExclusiveReset(awdlIbssExclusive);
+#endif
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = IC2IFP(ic);
     
@@ -939,9 +970,39 @@ iwm_ack_rates(struct iwm_softc *sc, struct iwm_node *in, int *cck_rates,
     *ofdm_rates = ofdm;
 }
 
+// Scan command submission may sleep and release the gate. Keep a logical
+// guard until the SCANNING/BGSCAN flag has been published after its response.
+struct ItlAwdlScanSubmission {
+    unsigned *depth;
+    explicit ItlAwdlScanSubmission(unsigned *p) : depth(p) { if (depth) ++*depth; }
+    ~ItlAwdlScanSubmission() { if (depth) --*depth; }
+};
+
 int ItlIwm::
 iwm_scan(struct iwm_softc *sc)
 {
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
+#if defined(AIRPORT_VTD) && defined(AIRPORT_WCL)
+    if (awdlAuxTxEnabled || awdlPeerRocEnabled) {
+        if (!getMainWorkLoop()->inGate()) {
+            struct Args { ItlIwm *self; iwm_softc *sc; int result; } args{this, sc, EBUSY};
+            getMainCommandGate()->runAction([](OSObject *, void *p, void *, void *, void *) -> IOReturn {
+                auto a = static_cast<Args *>(p); a->result = a->self->iwm_scan(a->sc); return kIOReturnSuccess;
+            }, &args);
+            return args.result;
+        }
+        if (awdlAuxTx.pending || (awdlPeerRocEnabled &&
+            (awdlRocSession.phase == ItlAwdl::RocPhase::Submitted || awdlRocSession.phase == ItlAwdl::RocPhase::AwaitStart ||
+             awdlRocSession.phase == ItlAwdl::RocPhase::Running || awdlRocSession.phase == ItlAwdl::RocPhase::Stopping))) return EBUSY;
+    }
+#endif
+#ifdef AIRPORT_WCL
+    ItlAwdlScanSubmission awdlScanGuard((awdlAuxTxEnabled || awdlPeerRocEnabled) ? &awdlScanSubmitting : nullptr);
+#endif
+
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = IC2IFP(ic);
@@ -994,6 +1055,27 @@ iwm_bgscan(struct ieee80211com *ic)
     XYLog("%s\n", __FUNCTION__);
     struct iwm_softc *sc = (struct iwm_softc *)IC2IFP(ic)->if_softc;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+#ifdef AIRPORT_WCL
+    ItlIbss::OrdinaryPermit ordinaryPermit(that->awdlIbssExclusive);
+    if (!ordinaryPermit) return EBUSY;
+#endif
+#if defined(AIRPORT_VTD) && defined(AIRPORT_WCL)
+    if (that->awdlAuxTxEnabled || that->awdlPeerRocEnabled) {
+        if (!that->getMainWorkLoop()->inGate()) {
+            struct Args { ieee80211com *ic; int result; } args{ic, EBUSY};
+            that->getMainCommandGate()->runAction([](OSObject *, void *p, void *, void *, void *) -> IOReturn {
+                auto a = static_cast<Args *>(p); a->result = ItlIwm::iwm_bgscan(a->ic); return kIOReturnSuccess;
+            }, &args);
+            return args.result;
+        }
+        if (that->awdlAuxTx.pending || (that->awdlPeerRocEnabled &&
+            (that->awdlRocSession.phase == ItlAwdl::RocPhase::Submitted || that->awdlRocSession.phase == ItlAwdl::RocPhase::AwaitStart ||
+             that->awdlRocSession.phase == ItlAwdl::RocPhase::Running || that->awdlRocSession.phase == ItlAwdl::RocPhase::Stopping))) return EBUSY;
+    }
+#endif
+#ifdef AIRPORT_WCL
+    ItlAwdlScanSubmission awdlScanGuard((that->awdlAuxTxEnabled || that->awdlPeerRocEnabled) ? &that->awdlScanSubmitting : nullptr);
+#endif
     int err;
     
     if (sc->sc_flags & IWM_FLAG_SCANNING)

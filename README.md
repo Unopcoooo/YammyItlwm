@@ -1,3 +1,39 @@
+# Experimental native AirDrop receive on Intel Wireless-AC 9560
+
+On November 8, 2026, an Intel Wireless-AC 9560 Hackintosh received a
+15,340,445-byte ZIP from a MacBook through macOS AirDrop over AWDL. The
+receiver logged the completed upload and extraction, the sender received
+the completion response, and the received ZIP passed an archive integrity
+check. See the [test record](docs/awdl-preview.md).
+
+This source preview is based on [laobamac/itlwm](https://github.com/laobamac/itlwm)
+and its AirportItlwm Sequoia target. The verified configuration was macOS
+Sequoia 15.8.1 (24H32), Intel Wireless-AC 9560 (PCI 8086:a370), Intel
+Core i5-9300H, and Intel 9000-series API 46 firmware.
+
+The experimental session takes exclusive use of the radio. In the verified
+run, infrastructure Wi-Fi did not recover within the trial deadline and
+became available later. The result covers MacBook → Hackintosh receive in
+this configuration. Reverse transfers, iPhone interoperability, other
+adapters, and concurrent infrastructure Wi-Fi remain unverified for this
+preview.
+
+## Build from source
+
+With Xcode and Python 3 installed:
+
+```sh
+git clone https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+git -C MacKernelSDK checkout 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+xcodebuild -project itlwm.xcodeproj -scheme AirportItlwm-Sequoia \
+  -configuration Release ARCHS=x86_64 CODE_SIGNING_ALLOWED=NO build
+```
+
+The published tree is for development review. The hardware run used an
+explicit experimental receive session and native service discovery.
+
+---
+
 [![Version](https://img.shields.io/github/v/tag/laobamac/itlwm?style=flat&label=Downloads)](https://github.com/laobamac/itlwm/releases)
 # itlwm
 

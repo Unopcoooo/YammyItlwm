@@ -25,6 +25,9 @@ class AirportItlwmSkywalkInterface : public IO80211InfraProtocol {
     OSDeclareDefaultStructors(AirportItlwmSkywalkInterface)
     
 public:
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
+    IOReturn newUserClient(task_t, void *, unsigned int, OSDictionary *, IOUserClient **) override;
+#endif
 #ifdef AIRPORT_WCL
     IOReturn getBSS_BLACKLIST(bss_blacklist*) override { return kIOReturnUnsupported; }
     IOReturn getHE_COUNTERS(apple80211_he_counters_ctl*) override { return kIOReturnUnsupported; }
@@ -260,7 +263,13 @@ public:
 #endif
     virtual IOReturn getP2P_STEERING_METRIC(apple80211_p2p_steering_metrics *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getRSN_XE(apple80211_rsn_xe_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getSIB_COEX_STATUS(apple80211_sib_coex_status *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    // Probe54: the peer manager's configure path needs both of these to succeed
+    // before it will mark AWDL as configured. They are implemented out of line so
+    // they can answer truthfully instead of failing closed:
+    //  - SIB coex: this card has no cellular SIB coexistence, so report "none".
+    //  - setCHANNEL: accepted only for the channel this driver's AWDL engine is
+    //    really scheduling dwells on; anything else stays unsupported.
+    virtual IOReturn getSIB_COEX_STATUS(apple80211_sib_coex_status *) AIRPORT_SKYWALK_OVERRIDE;
 #ifdef AIRPORT_WCL
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) override;
     IOReturn copyWCLExtendedBss(void *);
@@ -276,7 +285,7 @@ public:
     virtual IOReturn setSSID(apple80211_ssid_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setAUTH_TYPE(apple80211_authtype_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setCIPHER_KEY(apple80211_key *) AIRPORT_SKYWALK_OVERRIDE;
-    virtual IOReturn setCHANNEL(apple80211_channel_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setCHANNEL(apple80211_channel_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setPOWERSAVE(apple80211_powersave_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setTXPOWER(apple80211_txpower_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setRATE(apple80211_rate_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -301,7 +310,10 @@ public:
     virtual IOReturn setIE(apple80211_ie_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWOW_TEST(apple80211_wow_test_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSCANCACHE_CLEAR(void *) AIRPORT_SKYWALK_OVERRIDE;
-    virtual IOReturn setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    // Restored for macOS 13 and later: without this the AWDL interface can never
+    // be created, because this object is the one the family dispatches the ioctl
+    // to. Only the AWDL role is handled; the other roles stay unsupported.
+    virtual IOReturn setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setBT_COEX_FLAGS(apple80211_state_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setROAM(apple80211_sta_roam_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setHT_CAPABILITY(apple80211_ht_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
