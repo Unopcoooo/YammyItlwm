@@ -1,4 +1,12 @@
-# Experimental native AirDrop receive on Intel Wireless-AC 9560
+# Intel AC9560 原生 AirDrop 接收实验
+
+在 macOS Sequoia 15.8.1（24H32）上，Intel Wireless-AC 9560（PCI 8086:a370）通过系统 AirDrop 从 MacBook 成功接收了一个 15.3 MB 的 ZIP 文件。这个源码预览基于 AirportItlwm 的 Sequoia 驱动。实验会话独占无线电，实测中普通 Wi-Fi 超过试验时限才恢复。
+
+[源码预览](https://github.com/Unopcoooo/itlwm/releases/tag/ac9560-awdl-preview-1) · [实测记录](docs/awdl-preview.md) · [开发路线与 owly 致谢](docs/awdl-roadmap.md)
+
+## Experimental native AirDrop receive on Intel Wireless-AC 9560
+
+[Source preview](https://github.com/Unopcoooo/itlwm/releases/tag/ac9560-awdl-preview-1) · [Development roadmap and owly credits](docs/awdl-roadmap.md)
 
 On November 8, 2026, an Intel Wireless-AC 9560 Hackintosh received a
 15,340,445-byte ZIP from a MacBook through macOS AirDrop over AWDL. The
