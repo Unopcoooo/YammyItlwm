@@ -4,11 +4,20 @@
 
 在 macOS Sequoia 15.8.1（24H32）上，Intel Wireless-AC 9560（PCI 8086:a370）通过系统 AirDrop 从 MacBook 成功接收了一个 15.3 MB 的 ZIP 文件。这个源码预览基于 AirportItlwm 的 Sequoia 驱动。实验会话独占无线电，实测中普通 Wi-Fi 超过试验时限才恢复。
 
-[源码预览](https://github.com/Unopcoooo/itlwm/releases/tag/ac9560-awdl-preview-1) · [实测记录](docs/awdl-preview.md) · [开发路线与 owly 致谢](docs/awdl-roadmap.md)
+[源码预览](https://github.com/Unopcoooo/itlwm/releases/tag/ac9560-awdl-preview-1) · [实测记录](docs/awdl-preview.md) · [开发路线与 owly 致谢](docs/awdl-roadmap.md) · [版本状态与发布说明](docs/awdl-status.md)
 
 **实验限制与风险。** 当前版本没有用户可自行操作的 AirDrop 接收开关。实测时，我通过 Codex 调用项目的本地开发工具，手动开启约两分钟的 AWDL 接收窗口。会话期间会独占无线电，普通 Wi-Fi 可能暂时中断，退出后也可能延迟恢复。
 
 本版本仅供实验和试用，按现状提供，安全性、稳定性和兼容性均无保证。请在可恢复的测试环境中使用，并自行承担试用风险。
+
+### 已验证的范围
+
+- **原生 Mac → 黑苹果接收**：系统发现、接收确认、文件传输和 ZIP 完整性检查已通过；不是只出现设备头像。
+- **公开源码预览与后续本地版本分开记录**：`ac9560-awdl-preview-1` 对应 DDA9 里程碑。后续 19E2 已在同一次开机内通过两轮停止恢复；D3BE 接收队列候选仅通过离线验证，尚待实测。后两者不属于这个预览标签。
+- **性能仍在优化**：15.3 MB 文件的已记录传输约需 75–83 秒，不是高速 AirDrop。后续本地测试发现接收队列溢出和周期性停顿，尚未证明优化后的吞吐。
+- **尚未验证**：黑苹果发送、iPhone 双向互通、普通 Wi-Fi 与 AWDL 同时工作、其他 Intel 型号及 Tahoe 上的 AWDL。
+
+**下载说明：目前是源码预览，不是安装即用的 AirDrop 驱动包。** 公开树尚未提供实测所用的完整会话控制工具；仅编译并安装 kext 不能复现实验。`scripts/load.sh` / `unload.sh` 是继承的 itlwm 开发脚本，不是本实验的启动或恢复步骤。详见[版本状态与发布说明](docs/awdl-status.md)。
 
 ## Any tops here?
 
@@ -38,11 +47,32 @@ preview.
 
 This preview is provided as is for experimentation and testing. Security, stability, and compatibility are not guaranteed. Use a test environment you can recover and proceed at your own risk.
 
+### What the result establishes
+
+Native Mac → Hackintosh discovery, the system receive prompt, completed file
+reception and ZIP validation have been observed. A device icon alone is not
+counted as a successful transfer. Recorded 15.3 MB transfers took roughly
+75–83 seconds; high throughput is not yet established.
+
+The public `ac9560-awdl-preview-1` tag records the DDA9 milestone. Subsequent
+local build 19E2 passed two stop/recovery rounds in one boot. D3BE is an
+RX-queue candidate with offline validation only, pending hardware testing.
+Neither later build is included in that preview tag. See the
+[version status, evidence and release requirements](docs/awdl-status.md).
+
+This is a source preview, not an install-and-use AirDrop package. The complete
+session-control tooling used in the hardware trials is not included. Building
+and installing the kext alone does not reproduce the trial. The inherited
+`scripts/load.sh` and `scripts/unload.sh` target a different itlwm development
+workflow; they are not instructions for starting or restoring this AWDL session.
+
 ## Build from source
 
-With Xcode and Python 3 installed:
+With Xcode and Python 3 installed, clone the preview branch first:
 
 ```sh
+git clone --branch awdl/sequoia-ac9560-preview https://github.com/Unopcoooo/itlwm.git
+cd itlwm
 git clone https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
 git -C MacKernelSDK checkout 3f750085caa17ec3a7880f11c11bf4f48cd6a164
 xcodebuild -project itlwm.xcodeproj -scheme AirportItlwm-Sequoia \
@@ -55,7 +85,10 @@ explicit experimental receive session and native service discovery.
 ---
 
 [![Version](https://img.shields.io/github/v/tag/laobamac/itlwm?style=flat&label=Downloads)](https://github.com/laobamac/itlwm/releases)
-# itlwm
+# itlwm — inherited upstream documentation
+
+The sections below describe the upstream driver targets. Their downloads and
+compatibility claims do not establish support for this experimental AWDL branch.
 
 **An Intel Wi-Fi Adapter Kernel Extension for macOS, based on the OpenBSD Project.**
 
@@ -116,7 +149,7 @@ Check out our [FAQ Page](https://openintelwireless.github.io/itlwm/FAQ) for more
 
 If you have other questions or feedback, feel free to [![Join the chat at https://gitter.im/OpenIntelWireless/itlwm](https://badges.gitter.im/OpenIntelWireless/itlwm.svg)](https://gitter.im/OpenIntelWireless/itlwm?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge).
 
-We only accept bug reports in GitHub Issues, before opening an issue, you're recommended to reconfirm it with us on [Gitter](https://gitter.im/OpenIntelWireless/itlwm); once it's confirmed, please use the provided issue template.
+For this experimental AWDL fork, use the [test-report checklist](docs/awdl-status.md#reporting-results). Do not send fork-specific AWDL failures to upstream as if they were supported upstream features. The upstream links above remain useful for ordinary Wi-Fi documentation.
 
 ## Credits
 
