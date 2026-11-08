@@ -1,3 +1,17 @@
+# AWDL tests and historical observer notes
+
+This directory now contains offline tests for parsers, synchronization, data
+framing, session queues and runtime/lifecycle models. Passing these tests does
+not establish radio interoperability, Finder discovery or file-transfer success.
+See the [hardware test record](../../docs/awdl-preview.md) and
+[current version status](../../docs/awdl-status.md) for those claims.
+
+The notes below document the early RX-observer experiments only. Statements
+such as “not an AWDL implementation” and “awaiting boot validation” describe
+those historical builds, not the present source preview as a whole.
+
+---
+
 # AWDL RX observer, experiment 1
 
 This is a bounded wire-envelope parser and opt-in IWM RX observer, not an AWDL implementation. It does not create awdl0, transmit frames, elect a master, schedule channels, or implement AirDrop. It does not change receive filters or enable monitor mode.
