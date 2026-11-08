@@ -68,7 +68,7 @@ jobs:
   prerelease:
     name: Publish development build
     needs: build
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -110,11 +110,4 @@ jobs:
             fi
           done < release-assets.tsv
 
-          # Keep exactly one prerelease; stable releases are retained.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-            --jq '.[] | select(.prerelease and (.draft | not)) | .tag_name' > prereleases.txt
-          while IFS= read -r old_tag; do
-            if [[ "$old_tag" != "$tag" ]]; then
-              gh release delete "$old_tag" --yes --cleanup-tag
-            fi
-          done < prereleases.txt
+          # Preserve independent experimental prereleases and milestone tags.
