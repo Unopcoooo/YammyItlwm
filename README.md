@@ -6,6 +6,10 @@
 
 [源码预览](https://github.com/Unopcoooo/itlwm/releases/tag/ac9560-awdl-preview-1) · [实测记录](docs/awdl-preview.md) · [开发路线与 owly 致谢](docs/awdl-roadmap.md)
 
+**实验限制与风险。** 当前版本没有用户可自行操作的 AirDrop 接收开关。实测时，我通过 Codex 调用项目的本地开发工具，手动开启约两分钟的 AWDL 接收窗口。会话期间会独占无线电，普通 Wi-Fi 可能暂时中断，退出后也可能延迟恢复。
+
+本版本仅供实验和试用，按现状提供，安全性、稳定性和兼容性均无保证。请在可恢复的测试环境中使用，并自行承担试用风险。
+
 ## Any tops here?
 
 ### Experimental native AirDrop receive on Intel Wireless-AC 9560
@@ -29,6 +33,10 @@ became available later. The result covers MacBook → Hackintosh receive in
 this configuration. Reverse transfers, iPhone interoperability, other
 adapters, and concurrent infrastructure Wi-Fi remain unverified for this
 preview.
+
+**Experimental limitations and risks.** This preview has no user-facing toggle for AirDrop receive. In the hardware test, I used Codex to run the project's local development tooling and manually open an AWDL receive window of about two minutes. The session takes exclusive use of the radio, so normal Wi-Fi may be interrupted and may take time to recover afterward.
+
+This preview is provided as is for experimentation and testing. Security, stability, and compatibility are not guaranteed. Use a test environment you can recover and proceed at your own risk.
 
 ## Build from source
 
