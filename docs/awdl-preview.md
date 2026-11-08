@@ -1,4 +1,4 @@
-# November 8, 2026 AirDrop receive test
+# November 8, 2026 AirDrop receive test — DDA9 / preview-1
 
 | Field | Observed value |
 | --- | --- |
@@ -19,3 +19,8 @@
 The receiver recorded all upload bytes at 16:03:49 local time and the
 unpack response at 16:03:50. The sender recorded the response at 16:03:52.
 The record summarizes a single completed trial.
+
+This is the historical preview-1 result, not the latest local development
+status. See [version status and follow-up trials](awdl-status.md) for 19E2
+recovery results and the still-unvalidated D3BE throughput candidate.
+
