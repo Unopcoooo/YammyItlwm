@@ -38,7 +38,8 @@ int ITL_IBSS_DATA_TEST_MAIN(){
  iwm_device_cmd command,oldCommand;iwm_tfd tfd,oldTfd;uint16_t scheduler,oldScheduler;
  Segment seg={0x200000,80};assert(peerDataDescriptor(s,f.data(),f.size(),0x100000,0x10000c,&seg,1,3,1,3,command,tfd,scheduler));
  const auto tx=reinterpret_cast<const iwm_tx_cmd*>(command.data);
- assert(command.hdr.qid==10&&command.hdr.idx==3&&tx->sta_id==5&&!tx->tid_tspec&&tx->len==104&&tx->data_retry_limit==1&&tx->rts_retry_limit==1);
+ assert(command.hdr.qid==10&&command.hdr.idx==3&&tx->sta_id==5&&!tx->tid_tspec&&tx->len==104&&
+  tx->data_retry_limit==kPeerDataRetryLimit&&tx->rts_retry_limit==kPeerRtsRetryLimit);
  assert((tx->tx_flags&IWM_TX_CMD_FLG_ACK)&&!tx->sec_ctl&&tfd.num_tbs==3&&tfd.tbs[2].hi_n_len==(80<<4)&&scheduler==0x501c);
  oldCommand=command;oldTfd=tfd;oldScheduler=scheduler;
  for(bool badEntry:{false,true}){PeerState peer;Transport t;t.state=&peer;PeerCommands<Transport> p(t,peer);assert(!p.create(grant()));

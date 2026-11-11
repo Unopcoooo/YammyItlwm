@@ -1097,7 +1097,7 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
 #endif
             break;
         }
-
+        
 #ifdef AIRPORT_WCL
         awdlRxIngressEvent(ItlIbss::RxIngressDiagnostics::Notification,offset,unsigned(code));
 #endif
@@ -1386,7 +1386,8 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
             case IWM_SCAN_ITERATION_COMPLETE_UMAC: {
                 struct iwm_umac_scan_iter_complete_notif *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwm_umac_scan_iter_complete_notif *);
-                iwm_endscan(sc);
+                // The terminal UMAC notification retires the scan. Retiring here
+                // can let the old terminal notification finish a subsequent scan.
                 break;
             }
                 

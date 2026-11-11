@@ -50,10 +50,10 @@ public:
     IOReturn setAWDL_SYNC_STATE(apple80211_awdl_sync_state*) override;
     IOReturn setAWDL_ELECTION_RSSI_THRESHOLDS(apple80211_awdl_election_rssi_thresholds*) override;
     IOReturn setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode*) override;
-    IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control*) override { return unsupportedProtocol(40); }
-    IOReturn setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*) override { return unsupportedProtocol(41); }
+    IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control*) override;
+    IOReturn setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*) override;
     IOReturn setAWDL_SYNC_FRAME_TEMPLATE(apple80211_awdl_sync_frame_template*) override;
-    IOReturn setAWDL_ELECTION_PARAMS(apple80211_awdl_election_params*) override { return unsupportedProtocol(43); }
+    IOReturn setAWDL_ELECTION_PARAMS(apple80211_awdl_election_params*) override;
     IOReturn setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration*) override;
     IOReturn setAWDL_SECONDARY_MASTER_CHANNEL(apple80211_awdl_secondary_master_channel*) override { return unsupportedProtocol(45); }
     IOReturn setAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode*) override { return unsupportedProtocol(46); }
@@ -73,7 +73,7 @@ public:
     IOReturn setPSF_DWELL(apple80211_awdl_psf_dwell_params*) override { return unsupportedProtocol(60); }
     IOReturn setAWDL_CONFIG(apple80211_awdl_config_request*) override { return unsupportedProtocol(61); }
     IOReturn setAWDL_RTG_PEER_STATS_CONFIG(apple80211_rtg_peer_stats_cfg*) override { return unsupportedProtocol(62); }
-    IOReturn setMacAddress(ether_addr&) override { return kIOReturnUnsupported; }
+    IOReturn setMacAddress(ether_addr&) override;
     IOReturn newUserClient(task_t task, void *security, unsigned int type, OSDictionary *properties, IOUserClient **handler) override;
     UInt32 getFeatureFlags() override;
     static constexpr unsigned ProtocolMethodCount = 63;
@@ -163,7 +163,7 @@ public:
     bool probeNativeControlClose(); // Never waits; safe before native stop.
     bool probeNativeControlPermits(bool start);
     bool probeDuplicatePolicy(bool &enabled); // Same workloop gate.
-    OSObject *probeCopyPeerManager(); // Same workloop gate; caller releases.
+    OSObject *probeCopyPeerManager(bool requireActive = true); // Same workloop gate; caller releases.
     bool probeHasBoundBSD();
     ifnet_t probeCopyBoundBSD(); // Caller releases the retained, validated ifnet.
     bool probeRegisterResources(IOService *provider, const ether_addr &address);

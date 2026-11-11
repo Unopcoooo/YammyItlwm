@@ -175,6 +175,7 @@ void ItlIwm::awdlRocQuiesced() {
     awdlRawRxWindow={};awdlRxControlHomeChannel=0;
     awdlRocSession.resetAfterDeviceQuiesced(com.sc_generation);
     awdlAuxTx.deviceQuiesced();
+    itlNativeUmiQuiesce(this);
     ItlAwdl::gSingleDataProbe.quiesced();ItlAwdl::gTemplateRadio.pendingSingleData=false;
     if(ItlAwdl::gSingleDataProbe.everArmed)awdlSingleDataProbePublish();
     ItlAwdl::gDataPort.stop(true,ECANCELED); // Only after hardware stop and ring reset.

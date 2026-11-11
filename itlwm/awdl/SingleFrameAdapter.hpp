@@ -84,8 +84,9 @@ public:
     }
     uint64_t pendingDeadline()const{return tx_.pendingDeadline();}
     bool pending()const{return tx_.pending();}
+    unsigned rejectionStage()const{return rejectionStage_;}
 private:
-    bool reject(uint32_t stage){t_.record("AWDLIbssTxRejectStage",stage);return false;}
+    bool reject(uint32_t stage){rejectionStage_=stage;t_.record("AWDLIbssTxRejectStage",stage);return false;}
     void discard(){tx_.cancel();stopped_=true;t_.discardBuffer(buffer_);}
     void reclaim(){t_.reclaim(context_,buffer_);}
     void flushIfNeeded() {
@@ -97,5 +98,6 @@ private:
     }
     Transport &t_;const bool mdns_;TxContext context_;typename Transport::Buffer buffer_={};SingleTx tx_;
     bool started_=false,stopped_=false,preparing_=false,published_=false;
+    unsigned rejectionStage_=0;
 };
 }

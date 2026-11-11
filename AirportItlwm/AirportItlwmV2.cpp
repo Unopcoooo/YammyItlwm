@@ -20,6 +20,9 @@
 #include "ItlAwdlResources.hpp"
 #include "../itlwm/awdl/DataDriver.hpp"
 #include "../itlwm/awdl/NativeControlAdapter.hpp"
+#include "../itlwm/awdl/NativePeerCacheControl.hpp"
+#include "../itlwm/awdl/NativeElectionParams.hpp"
+#include "../itlwm/awdl/NativeUmi.hpp"
 #include <kern/thread_call.h>
 #include "../itlwm/awdl/NativeBsdBinding.hpp"
 #include "../itlwm/awdl/NativePeerRegistration.hpp"
@@ -64,6 +67,8 @@ extern "C" bool ItlNativeSetInterfaceFlags(void *self, uint16_t set, uint16_t cl
 // The legacy IONetworkInterface::setExtendedFlags is a no-op on24H32.
 extern "C" uint32_t ItlIfnetEflags(ifnet_t) __asm__("_ifnet_eflags");
 extern "C" errno_t ItlIfnetSetEflags(ifnet_t,uint32_t,uint32_t) __asm__("_ifnet_set_eflags");
+extern "C" IO80211VirtualInterface *ItlNativePmVirtualInterface(void *)
+    __asm__("__ZN18IO80211PeerManager19getVirtualInterfaceEv");
 static_assert(APPLE80211_VIF_AWDL == 6, "Sequoia target AWDL role ABI");
 
 static int gItlAwdlNameClears = 0;
@@ -282,12 +287,114 @@ IOReturn ItlAwdlInterface::getPEER_CACHE_MAXIMUM_SIZE(apple80211_peer_cache_maxi
     return kIOReturnSuccess;
 }
 
+IOReturn ItlAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_control *data)
+{
+    recordProtocol(40);
+    if (!data)
+        return kIOReturnBadArgument;
+    uint32_t operation = 0;
+    uint8_t address[ItlAwdl::NativePeerCacheControl::AddressLength] = {};
+    if (!ItlAwdl::NativePeerCacheControl::decode(
+            data, ItlAwdl::NativePeerCacheControl::Size, operation, address))
+        return kIOReturnUnsupported;
+    auto manager = probeCopyPeerManager();
+    const bool nativePeerManager = manager &&
+        !strcmp(manager->getMetaClass()->getClassName(), "IO80211AWDLPeerManager") &&
+        ItlNativePmVirtualInterface(manager) == this;
+    if (manager)
+        manager->release();
+    if (!nativePeerManager)
+        return kIOReturnNotReady;
+    auto controller = OSDynamicCast(AirportItlwm, getProvider());
+    uint8_t completion[ItlAwdl::NativePeerCacheControl::Size] = {};
+    if (!controller || !ItlAwdl::NativePeerCacheControl::makeCompletion(
+            data, ItlAwdl::NativePeerCacheControl::Size, completion))
+        return kIOReturnNotReady;
+    // Intel has no matching firmware cache ioctl. The native PeerManager owns
+    // this request; report the software cache acceptance through its event path.
+    setProperty("AWDLProbePeerCacheOpcode", operation, 32);
+    setProperty("AWDLProbePeerCachePeer", address, sizeof(address));
+    const IOReturn posted = controller->postMessage(
+        this, 0x33, completion, sizeof(completion), true);
+    setProperty("AWDLProbePeerCacheResult", static_cast<uint32_t>(posted), 32);
+    if (posted != kIOReturnSuccess)
+        return posted;
+    IOLog("itlwm-awdl: peer cache op %u for %02x:%02x:%02x:%02x:%02x:%02x completed\n",
+        operation, address[0], address[1], address[2], address[3], address[4], address[5]);
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlAwdlInterface::setAWDL_OOB_REQUEST(apple80211_awdl_oob_request *request)
+{
+    recordProtocol(41);
+    setProperty("AWDLNativeUmiLastEntry", 1, 8);
+    auto finish = [this](IOReturn result, uint32_t reason) {
+        setProperty("AWDLNativeUmiLastEntryReason", reason, 32);
+        setProperty("AWDLNativeUmiEntryResult", uint32_t(result), 32);
+        return result;
+    };
+#ifdef AIRPORT_WCL
+    auto loop = getWorkLoop();
+    if (!request || !loop || !loop->inGate() || probeStopDone || isInactive())
+        return finish(kIOReturnUnsupported, 1);
+    auto controller = OSDynamicCast(AirportItlwm, getProvider());
+    auto hal = controller ? OSDynamicCast(ItlIwm, controller->fHalService) : nullptr;
+    if (!hal || !hal->awdlNativeControlReadable(loop) ||
+        ItlAwdl::gDataPort.owner != this || ItlAwdl::gDataPort.releasePending)
+        return finish(kIOReturnNotReady, 2);
+    auto manager = probeCopyPeerManager();
+    if (!manager) return finish(kIOReturnNotReady, 3);
+    const bool nativeManager = !strcmp(manager->getMetaClass()->getClassName(),
+                                       "IO80211AWDLPeerManager") &&
+        ItlNativePmVirtualInterface(manager) == this;
+    if (!nativeManager) {
+        manager->release();
+        return finish(kIOReturnNotReady, 4);
+    }
+    const uint8_t *priv = nullptr;
+    memcpy(&priv, reinterpret_cast<const uint8_t *>(manager) + 0x20, sizeof(priv));
+    const auto header = reinterpret_cast<const uint8_t *>(request);
+    uint16_t length = 0;
+    const uint8_t *supplied = nullptr;
+    memcpy(&length, header + 0x28, sizeof(length));
+    memcpy(&supplied, header + 0x30, sizeof(supplied));
+    uint32_t liveLength = 0;
+    if (priv) memcpy(&liveLength, priv + 0x2808, sizeof(liveLength));
+    const bool valid = priv && supplied == priv + 0x2358 && length &&
+        length <= ItlAwdl::kNativeUmiPayloadMax && liveLength == length &&
+        ItlAwdl::nativeUmiUnicast(header + 4);
+    if (!valid) {
+        manager->release();
+        return finish(kIOReturnUnsupported, 5);
+    }
+    setProperty("AWDLNativeUmiRequestPeer", const_cast<uint8_t *>(header + 4), 6);
+    const auto result = hal->awdlNativeUmiRequest(header + 4, supplied, length, 1);
+    manager->release();
+    setProperty("AWDLNativeUmiRequestResult", uint32_t(result), 32);
+    setProperty("AWDLNativeUmiRequestLength", length, 16);
+    if (result != kIOReturnSuccess) return finish(result, 6);
+    IOLog("itlwm-awdl: queued native UMI for %02x:%02x:%02x:%02x:%02x:%02x (%u bytes)\n",
+          header[4], header[5], header[6], header[7], header[8], header[9], length);
+    return finish(kIOReturnSuccess, 7);
+#else
+    return finish(kIOReturnUnsupported, 8);
+#endif
+}
+
 IOReturn ItlAwdlInterface::setAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *data)
 {
     recordProtocol(34);
     if (!data) return kIOReturnBadArgument;
-    // PeerManager handles override policy; the native metric backend is not implemented.
-    return kIOReturnUnsupported;
+    auto root = OSDynamicCast(AirportItlwm, getProvider());
+    auto hal = root ? OSDynamicCast(ItlIwm, root->fHalService) : nullptr;
+    IOReturn result = kIOReturnNotReady;
+    if (hal && !probeStopDone) {
+        hal->retain();
+        result = hal->awdlNativeElectionMetric(data, sizeof(*data), this);
+        hal->release();
+    }
+    setProperty("AWDLNativeElectionMetricResult", uint32_t(result), 32);
+    return result;
 }
 
 IOReturn ItlAwdlInterface::setAWDL_ELECTION_RSSI_THRESHOLDS(
@@ -353,6 +460,26 @@ IOReturn ItlAwdlInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state *data)
     return result;
 }
 
+IOReturn ItlAwdlInterface::setAWDL_ELECTION_PARAMS(
+        apple80211_awdl_election_params *data)
+{
+    recordProtocol(43);
+    if (!data) return kIOReturnBadArgument;
+    setProperty("AWDLNativeElectionRequestBytes",
+        static_cast<uint32_t>(ItlAwdl::kNativeElectionParamsSize), 32);
+    auto root = OSDynamicCast(AirportItlwm, getProvider());
+    auto hal = root ? OSDynamicCast(ItlIwm, root->fHalService) : nullptr;
+    IOReturn result = kIOReturnNotReady;
+    if (hal && !probeStopDone) {
+        hal->retain();
+        result = hal->awdlNativeElectionParams(data,
+            ItlAwdl::kNativeElectionParamsSize, this);
+        hal->release();
+    }
+    setProperty("AWDLNativeElectionResult", uint32_t(result), 32);
+    return result;
+}
+
 IOReturn ItlAwdlInterface::setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *data)
 {
     recordProtocol(39);
@@ -379,8 +506,19 @@ IOReturn ItlAwdlInterface::getAWDL_ELECTION_METRIC(apple80211_awdl_election_metr
 {
     recordProtocol(8);
     if (!data) return kIOReturnBadArgument;
-    // PeerManager handles override policy; the native metric backend is not implemented.
-    return kIOReturnUnsupported;
+    auto root = OSDynamicCast(AirportItlwm, getProvider());
+    auto hal = root ? OSDynamicCast(ItlIwm, root->fHalService) : nullptr;
+    if (!hal || probeStopDone) return kIOReturnNotReady;
+    uint32_t metric = 0;
+    uint8_t overrideMetric = 0;
+    hal->retain();
+    const IOReturn result = hal->awdlNativeElectionMetricRead(metric, overrideMetric);
+    hal->release();
+    if (result != kIOReturnSuccess) return result;
+    data->metric = metric;
+    setProperty("AWDLNativeElectionMetricRead", metric, 32);
+    setProperty("AWDLNativeElectionMetricOverrideRead", overrideMetric, 8);
+    return kIOReturnSuccess;
 }
 
 IOReturn ItlAwdlInterface::setAWDL_BSSID(apple80211_awdl_bssid *data)
@@ -450,7 +588,17 @@ IOReturn ItlAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_pee
     setProperty("AWDLProbeTrafficActive", (unsigned long long)gItlAwdlTrafficActive, 32);
     setProperty("AWDLProbeTrafficRegistrations",
         (unsigned long long)gItlAwdlTrafficRegistrations, 32);
+#ifdef AIRPORT_WCL
+    // This driver owns the AWDL peer table; the native table has no matching
+    // entry, so forwarding returns kIOReturnNotFound and aborts AirDrop ASK.
+    setProperty("AWDLProbeTrafficForwarded",false);
+    setProperty("AWDLProbeTrafficDeferred",false);
+    setProperty("AWDLProbeTrafficResult",
+        (unsigned long long)(uint32_t)kIOReturnSuccess,32);
     return kIOReturnSuccess;
+#else
+    return kIOReturnSuccess;
+#endif
 }
 
 IOReturn ItlAwdlInterface::newUserClient(task_t task, void *security, unsigned int type,
@@ -480,6 +628,44 @@ UInt32 ItlAwdlInterface::getFeatureFlags()
     const UInt32 flags = IO80211VirtualInterface::getFeatureFlags();
     setProperty("AWDLTraceFeatureFlags", flags, 32);
     return flags;
+}
+
+IOReturn ItlAwdlInterface::setMacAddress(ether_addr &address)
+{
+    setProperty("AWDLSetMacEntry", true);
+    const IO80211LinkState state = linkState();
+    setProperty("AWDLSetMacLinkState", uint32_t(state), 32);
+    if (address.octet[0] & 1) {
+        setProperty("AWDLSetMacResult", uint32_t(kIOReturnBadArgument), 32);
+        return kIOReturnBadArgument;
+    }
+    bool nonzero = false;
+    for (unsigned i = 0; i < 6; ++i)
+        nonzero |= address.octet[i] != 0;
+    if (!nonzero) {
+        setProperty("AWDLSetMacResult", uint32_t(kIOReturnBadArgument), 32);
+        return kIOReturnBadArgument;
+    }
+    auto net = getBSDInterface();
+    if (!net) {
+        setProperty("AWDLSetMacResult", uint32_t(kIOReturnNotReady), 32);
+        return kIOReturnNotReady;
+    }
+    const IOReturn result = IO80211SkywalkInterface::setHardwareAddress(&address);
+    setProperty("AWDLSetMacHardwareResult", uint32_t(result), 32);
+    if (result != kIOReturnSuccess) {
+        setProperty("AWDLSetMacResult", uint32_t(result), 32);
+        return result;
+    }
+    const errno_t bsdResult = ifnet_set_lladdr(net, address.octet, IEEE80211_ADDR_LEN);
+    setProperty("AWDLSetMacBSDResult", uint32_t(bsdResult), 32);
+    if (bsdResult) {
+        setProperty("AWDLSetMacResult", uint32_t(kIOReturnError), 32);
+        return kIOReturnError;
+    }
+    setProperty("AWDLSetMacResult", uint32_t(kIOReturnSuccess), 32);
+    setProperty("AWDLUpdatedMacAddress", address.octet, IEEE80211_ADDR_LEN);
+    return kIOReturnSuccess;
 }
 
 void ItlAwdlInterface::postAvailabilityWindowEvent(bool start, uint32_t firmwareStartGp2,
@@ -868,8 +1054,6 @@ extern "C" bool ItlNativeAwdlConfigured(void *)
     __asm__("__ZN22IO80211AWDLPeerManager16isAwdlConfiguredEv");
 extern "C" bool ItlNativeAwdlConfigureInProgress(void *)
     __asm__("__ZN22IO80211AWDLPeerManager25isAwdlConfigureInProgressEv");
-extern "C" IO80211VirtualInterface *ItlNativePmVirtualInterface(void *)
-    __asm__("__ZN18IO80211PeerManager19getVirtualInterfaceEv");
 
 bool ItlAwdlInterface::probeNativeControlPermits(bool start){
     if(!probeBSDLock)return false;
@@ -903,8 +1087,8 @@ bool ItlAwdlInterface::probeNativeControlClose(){
     IOLockUnlock(probeBSDLock);return drained;
 }
 
-OSObject *ItlAwdlInterface::probeCopyPeerManager(){
-    if(probeStopDone||isInactive()||!getWorkLoop()||!getWorkLoop()->inGate())return nullptr;
+OSObject *ItlAwdlInterface::probeCopyPeerManager(bool requireActive){
+    if(probeStopDone||(requireActive&&isInactive())||!getWorkLoop()||!getWorkLoop()->inGate())return nullptr;
     const uint8_t *expansion=nullptr;OSObject *peer=nullptr;
     memcpy(&expansion,reinterpret_cast<const uint8_t *>(this)+0x110,sizeof(expansion));
     if(expansion)memcpy(&peer,expansion+0x28,sizeof(peer));
@@ -926,29 +1110,39 @@ bool ItlAwdlInterface::probeDuplicatePolicy(bool &enabled){
 // discovery session holds this interface. No caller-owned pointer is retained.
 IOReturn ItlAwdlInterface::setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request *request){
     recordProtocol(50);
+    setProperty("AWDLNativeUmiLastEntry", 2, 8);
+    auto finish = [this](IOReturn result, uint32_t reason) {
+        setProperty("AWDLNativeUmiLastEntryReason", reason, 32);
+        setProperty("AWDLNativeUmiAutoEntryResult", uint32_t(result), 32);
+        return result;
+    };
     OSIncrementAtomic(&gServiceMifStages[0]);
     const auto revision=ItlAwdl::invalidateOob();
 #ifdef AIRPORT_WCL
     auto loop=getWorkLoop();
-    if(!request||!loop||!loop->inGate()||probeStopDone||isInactive())return kIOReturnUnsupported;
+    if(!request||!loop||!loop->inGate()||probeStopDone||isInactive())
+        return finish(kIOReturnUnsupported,1);
     OSIncrementAtomic(&gServiceMifStages[1]);
     auto controller=OSDynamicCast(AirportItlwm,getProvider());
     auto hal=controller?OSDynamicCast(ItlIwm,controller->fHalService):nullptr;
     if(!hal||!hal->awdlNativeControlReadable(loop)||ItlAwdl::gDataPort.owner!=this||
-       ItlAwdl::gDataPort.releasePending)return kIOReturnUnsupported;
+       ItlAwdl::gDataPort.releasePending)return finish(kIOReturnUnsupported,2);
     auto &d=hal->awdlNativeDiscovery;
     if(!d.open||d.closed||d.owner!=reinterpret_cast<uintptr_t>(this)||
-       d.epoch!=hal->awdlNativeSearch.epoch||!hal->awdlNativeSyncRoleConfirmed())return kIOReturnUnsupported;
+       d.epoch!=hal->awdlNativeSearch.epoch)return finish(kIOReturnUnsupported,3);
     OSIncrementAtomic(&gServiceMifStages[2]);
     auto pm=probeCopyPeerManager();
-    if(!pm)return kIOReturnUnsupported;
+    if(!pm)return finish(kIOReturnUnsupported,4);
+    const uint8_t *supplied=nullptr;
+    size_t count=0;
+    bool offered=false;
     if(!strcmp(pm->getMetaClass()->getClassName(),"IO80211AWDLPeerManager")&&
        ItlNativePmVirtualInterface(pm)==this&&ItlNativeAwdlConfigured(pm)){
         OSIncrementAtomic(&gServiceMifStages[3]);
-        const uint8_t *priv=nullptr,*supplied=nullptr;
+        const uint8_t *priv=nullptr;
         memcpy(&priv,reinterpret_cast<const uint8_t *>(pm)+0x20,sizeof(priv));
         const auto header=reinterpret_cast<const uint8_t *>(request);
-        const size_t count=ItlAwdl::dataLe16(header+0x28);
+        count=ItlAwdl::dataLe16(header+0x28);
         memcpy(&supplied,header+0x30,sizeof(supplied));
         uint32_t liveLength=0;
         if(priv&&count&&count<=1200&&supplied==priv+0x2358){
@@ -962,18 +1156,25 @@ IOReturn ItlAwdlInterface::setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request 
                 if(sample){
                     const auto bytes=static_cast<const uint8_t *>(sample->getBytesNoCopy());
                     if(d.matches(reinterpret_cast<uintptr_t>(this),hal->awdlNativeSearch.epoch,d.generation,now)&&
-                       d.mifService.offer(bytes,count,d.local,revision,d.epoch,d.generation,now))
+                       d.mifService.offer(bytes,count,d.local,revision,d.epoch,d.generation,now)){
                         OSIncrementAtomic(&gServiceMifStages[5]);
+                        offered=true;
+                    }
                     sample->release();
                 }
             }
         }
     }
+    if(!offered){
+        pm->release();
+        return finish(kIOReturnUnsupported,5);
+    }
+    setProperty("AWDLNativeUmiAutoLength",count,16);
     pm->release();
 #endif
-    // The manual bounded TX job can sample service metadata. Generic OOB
-    // auto scheduling and its completion contract are still unsupported.
-    return kIOReturnUnsupported;
+    // Auto MI is periodic control-plane work. Once its service snapshot is
+    // accepted, report success even when this request was multicast-only.
+    return finish(kIOReturnSuccess,6);
 }
 
 IOReturn AirportItlwm::awdlPublishNativeControlState(){
@@ -1079,6 +1280,7 @@ struct ItlNativePeerOps:ItlNativeBsdOps {
     int absent(void *value,const ItlAwdl::NativePeerKey &key){return notice(value,key,false);}
 };
 static ItlAwdl::NativePeerRegistration<OSObject> awdlNativePeer;
+static ItlAwdl::NativePeerRegistration<OSObject> awdlDiscoveryPeers[ItlAwdl::NativeDiscoverySession::PeerCapacity];
 
 // The actual two-argument virtual-interface implementation returns bool on this
 // kernel; the legacy local declaration says void. Do not infer success from it.
@@ -1202,7 +1404,9 @@ IOReturn AirportItlwm::awdlDataDispatch(ItlAwdlDataCall &call)
         if(call.kind==ItlAwdlDataCall::Quiesce){
             if(port.owner!=call.owner)return kIOReturnNotReady;
             port.stop(false,ECANCELED);
-            auto hal=OSDynamicCast(ItlIwm,self->fHalService);if(hal){if(hal->awdlNativeSearchReserved())hal->awdlNativeSearchRequest(true);hal->awdlIbssNativeQuiesce();}
+            // The native virtual interface may quiesce independently. The
+            // explicit host lease remains the search owner until Stop.
+            auto hal=OSDynamicCast(ItlIwm,self->fHalService);if(hal)hal->awdlIbssNativeQuiesce();
             return kIOReturnSuccess;
         }
         if(call.kind==ItlAwdlDataCall::Maintenance){
@@ -1219,23 +1423,29 @@ IOReturn AirportItlwm::awdlDataDispatch(ItlAwdlDataCall &call)
             if(call.kind==ItlAwdlDataCall::NativeSyncEnable){
                 if(!hal||port.releasePending||!self->awdlControlPermitsEnable())return kIOReturnNotReady;
                 // Preserve an existing diagnostic native data session; never substitute a search for it.
-                if(port.nativeSession||port.tx.enabled)
-                    return port.nativeSession&&port.linkUp&&!port.linkBusy&&!port.linkDownPending&&
+                if(port.nativeSession||port.tx.enabled){
+                    const auto result=port.nativeSession&&port.linkUp&&!port.linkBusy&&!port.linkDownPending&&
                         hal->awdlIbssNativeLeaseReason()==0?kIOReturnSuccess:kIOReturnNotReady;
-                return hal->awdlNativeSearchEnable();
+                    if(result==kIOReturnSuccess)hal->awdlNativeSyncRequested=true;
+                    return result;
+                }
+                const auto result=hal->awdlNativeSearchEnable();
+                if(result==kIOReturnSuccess)hal->awdlNativeSyncRequested=true;
+                return result;
             }
             if(call.kind==ItlAwdlDataCall::NativeSyncDisable){
                 if(port.tx.enabled&&!port.nativeSession)return kIOReturnUnsupported;
-                // Admission precedes opening data queues; Disable must also cancel preparation.
-                if(port.nativeSession||(hal&&(hal->awdlIbssNativePending()||hal->awdlNativeSearchReserved()))){
+                if(hal)hal->awdlNativeSyncRequested=false;
+                // Native protocol disable retires only the native diagnostic
+                // session. The explicit host lease remains the data owner.
+                if(port.nativeSession||(hal&&hal->awdlIbssNativePending())){
                     if(!hal)return kIOReturnNotReady;
-                    if(hal->awdlNativeSearchReserved())hal->awdlNativeSearchRequest(true);
                     port.stop(false,ECANCELED);hal->awdlIbssNativeQuiesce();hal->awdlIbssNativeQueuesStop();
                 }
                 return kIOReturnSuccess;
             }
             call.result=hal&&!port.releasePending&&((port.linkUp&&!port.linkBusy&&!port.linkDownPending&&
-                hal->awdlIbssNativeLeaseReason()==0)||(hal->awdlNativeSearchEnabled()&&
+                hal->awdlIbssNativeLeaseReason()==0)||(hal->awdlNativeSyncRequested&&hal->awdlNativeSearchEnabled()&&
                     (!hal->awdlNativeControlTx.nativeRoleAccepted||hal->awdlNativeSyncRoleReady())));
             return kIOReturnSuccess;
         }
@@ -1471,7 +1681,7 @@ void ItlAwdlInterface::stopProbe(IOService *provider)
 struct ItlNativeControlJob {
     AirportItlwm *controller;ItlAwdlInterface *interface;ItlIwm *hal;
     IOCommandGate *gate;IOWorkLoop *loop;uint64_t epoch;
-    bool firstUp=false,publishedUp=false,executing=false,quarantined=false,retiring=false,handedOff=false;uint64_t serial=0;IO80211VirtualInterface *stoppedChildReference=nullptr;
+    bool firstUp=false,publishedUp=false,executing=false,executingUp=false,quarantined=false,retiring=false,handedOff=false;uint64_t serial=0;IO80211VirtualInterface *stoppedChildReference=nullptr;
 };
 bool AirportItlwm::awdlControlHasJob(){
     if(!fAwdlControlLock)return false;
@@ -1542,12 +1752,15 @@ bool ItlNativeWarmParamsAllowed(OSObject *root,OSObject *owner,uint64_t epoch){
     auto controller=OSDynamicCast(AirportItlwm,root);
     return controller && controller->awdlControlAllowsWarmParams(owner,epoch);
 }
-// Role admission is confined to the retained, pinned native-control transaction.
+// Role state is admitted while the retained transaction is executing or after
+// its confirmed link-up has been published. Native election reconfiguration
+// arrives after the first up call and must still use the same pinned job.
 bool AirportItlwm::awdlControlAllowsRole(OSObject *owner,uint64_t epoch,bool entering){
     if(!owner||!epoch||!fAwdlControlLock)return false;
     IOLockLock(fAwdlControlLock);auto job=fAwdlControlJob;
     const bool allowed=!fAwdlControlClosing&&job&&job->epoch==epoch&&job->interface==owner&&
-        fAWDLInterface==owner&&job->hal==OSDynamicCast(ItlIwm,fHalService)&&job->serial&&(!entering||job->executing)&&
+        fAWDLInterface==owner&&job->hal==OSDynamicCast(ItlIwm,fHalService)&&job->serial&&
+        (job->executing||job->publishedUp)&&
         !job->retiring&&!job->quarantined;
     IOLockUnlock(fAwdlControlLock);return allowed;
 }
@@ -1584,7 +1797,8 @@ uint64_t AirportItlwm::awdlControlNativeBegin(uint64_t epoch,bool up){
            job->serial!=UINT64_MAX&&(!request.up||(!self->fAwdlControlClosing&&
            job->hal->awdlNativeSearch.matches(request.epoch)&&job->hal->awdlNativeSearchEnabled()))){
             job->firstUp=request.up && job->serial==0;
-            job->publishedUp=false;
+            if(job->firstUp)job->publishedUp=false;
+            job->executingUp=request.up;
             job->executing=true;request.serial=++job->serial;
         }
         IOLockUnlock(self->fAwdlControlLock);return kIOReturnSuccess;
@@ -1596,8 +1810,12 @@ bool AirportItlwm::awdlControlNativeEnd(uint64_t epoch,uint64_t serial,bool link
     IOLockLock(fAwdlControlLock);auto job=fAwdlControlJob;
     const bool valid=job&&job->epoch==epoch&&serial&&job->serial==serial&&job->executing;
     if(valid){
-        job->publishedUp=job->firstUp && linked;
+        // Discovery and peer publication issue later UP transactions. They must
+        // not erase the confirmed first link-up that authorizes native role work.
+        if(job->firstUp)job->publishedUp=linked;
+        else if(!job->executingUp)job->publishedUp=false;
         job->firstUp=false;
+        job->executingUp=false;
         job->executing=false;
     }
     IOLockUnlock(fAwdlControlLock);return valid;
@@ -1688,16 +1906,36 @@ class ItlNativeControlCallout:public OSObject {
 public:
     AirportItlwm *controller=nullptr;IOCommandGate *gate=nullptr;IOWorkLoop *loop=nullptr;
     ItlAwdlInterface *interface=nullptr;thread_call_t call=nullptr;uint64_t epoch=0;
+    void *controlBsd=nullptr;
     bool completionRequested=false,gateFault=false;unsigned upCalls=0,downCalls=0;
     OSObject *before=nullptr,*during=nullptr,*after=nullptr;
     bool discoveryAttempted=false,discoveryBound=false,discoveryFailed=false;
     void discoveryPump();
     void trace(unsigned state,bool retired);
     bool init() override {return OSObject::init();}
+    bool prepareControlBsd(){
+        if(controlBsd)return true;
+        if(!interface)return false;
+        auto net=interface->probeCopyBoundBSD();
+        if(!net)return false;
+        const auto result=interface->IOSkywalkNetworkInterface::prepareBSDInterface(net,0);
+        interface->setProperty("AWDLNativeActiveSocketsBSDPrepared",result==kIOReturnSuccess);
+        if(result!=kIOReturnSuccess){ItlIfnetRelease(net);return false;}
+        controlBsd=net;
+        return true;
+    }
+    void dropControlBsd(){
+        if(!controlBsd)return;
+        const bool borrowed=awdlNativeBsdBinding.owner==interface&&awdlNativeBsdBinding.interface==controlBsd;
+        if(interface&&!borrowed)interface->IOSkywalkNetworkInterface::finalizeBSDInterface(
+            static_cast<ifnet_t>(controlBsd),0);
+        ItlIfnetRelease(static_cast<ifnet_t>(controlBsd));controlBsd=nullptr;
+    }
     ItlNativeControlOps ops;ItlNativeControlOps::Adapter adapter;
     static void run(void *argument,void *);
     void free() override {
         if(call)thread_call_free(call);
+        dropControlBsd();
         OSSafeReleaseNULL(before);OSSafeReleaseNULL(during);OSSafeReleaseNULL(after);
         OSSafeReleaseNULL(gate);OSSafeReleaseNULL(loop);OSSafeReleaseNULL(controller);
         OSObject::free();
@@ -1727,14 +1965,37 @@ ItlNativeControlOps::Sample ItlNativeControlOps::sample(Owner *owner){
     Sample s;auto root=job->controller;auto hal=OSDynamicCast(ItlIwm,root->fHalService);
     uint64_t absoluteTick=mach_absolute_time();absolutetime_to_nanoseconds(absoluteTick,&s.now);
     if(hal)s.search=hal->awdlNativeSearch;
-    if(!inGate()||owner!=job->interface||root->fAWDLInterface!=owner||!hal||
-       !root->awdlControlPermitsEnable()||owner->isInactive()||owner->probeStopDone||
-       ItlAwdl::gDataPort.owner!=owner||ItlAwdl::gDataPort.releasePending||!hal->awdlNativeSearchEnabled())return s;
-    auto manager=owner->probeCopyPeerManager();
-    s.qualified=manager&&!strcmp(manager->getMetaClass()->getClassName(),"IO80211AWDLPeerManager")&&
-        ItlNativePmVirtualInterface(manager)==owner;
-    if(manager)manager->release();
-    if(job->upCalls&&hal->awdlNativeControlTx.nativeRoleAccepted&&!hal->awdlNativeSyncRoleReady())s.qualified=false;
+    uint64_t mask=0;
+#define ITL_CONTROL_SAMPLE(bit,value) do{if(value)mask|=uint64_t(1)<<(bit);}while(0)
+    ITL_CONTROL_SAMPLE(0,inGate());
+    ITL_CONTROL_SAMPLE(1,owner&&owner==job->interface);
+    ITL_CONTROL_SAMPLE(2,owner&&root&&root->fAWDLInterface==owner);
+    ITL_CONTROL_SAMPLE(3,hal);
+    ITL_CONTROL_SAMPLE(4,root&&root->awdlControlPermitsEnable());
+    ITL_CONTROL_SAMPLE(5,owner&&!owner->isInactive());
+    ITL_CONTROL_SAMPLE(6,owner&&!owner->probeStopDone);
+    ITL_CONTROL_SAMPLE(7,owner&&ItlAwdl::gDataPort.owner==owner);
+    ITL_CONTROL_SAMPLE(8,!ItlAwdl::gDataPort.releasePending);
+    ITL_CONTROL_SAMPLE(9,hal&&hal->awdlNativeSearchEnabled());
+    bool managerPresent=false,managerClass=false,managerMatches=false;
+    if(owner&&hal&&(mask&0x3fe)==0x3fe){
+        auto manager=owner->probeCopyPeerManager();
+        managerPresent=manager!=nullptr;
+        managerClass=manager&&!strcmp(manager->getMetaClass()->getClassName(),"IO80211AWDLPeerManager");
+        managerMatches=managerClass&&ItlNativePmVirtualInterface(manager)==owner;
+        if(manager)manager->release();
+    }
+    ITL_CONTROL_SAMPLE(10,managerPresent);
+    ITL_CONTROL_SAMPLE(11,managerClass);
+    ITL_CONTROL_SAMPLE(12,managerMatches);
+#undef ITL_CONTROL_SAMPLE
+    s.qualified=(mask&0x1fff)==0x1fff;
+    root->setProperty("AWDLNativeControlSampleMask",mask,64);
+    root->setProperty("AWDLNativeControlSampleUpCalls",job->upCalls,32);
+    root->setProperty("AWDLNativeControlSampleQualified",s.qualified);
+    // Native protocol role changes must not tear down the host-owned data
+    // lease. The control worker retires on its own; only search stop or a
+    // confirmed native disable closes the underlying link.
     return s;
 }
 bool ItlNativeControlOps::pin(Owner *owner){
@@ -1748,7 +2009,8 @@ void ItlNativeControlOps::unpin(Owner *owner){
 bool ItlNativeControlOps::publish(Owner *owner){
     if(inGate())return false;
     const auto serial=job->controller->awdlControlNativeBegin(job->epoch,true);if(!serial)return false;
-    ++job->upCalls;const bool accepted=ItlNativeVirtualLink(owner,kIO80211NetworkLinkUp,1);
+    ++job->upCalls;const bool bsdPrepared=job->prepareControlBsd();
+    const bool accepted=bsdPrepared&&ItlNativeVirtualLink(owner,kIO80211NetworkLinkUp,1);
     const bool linked=owner->linkState()==kIO80211NetworkLinkUp;
     const bool ended=job->controller->awdlControlNativeEnd(job->epoch,serial,accepted&&linked);
     withGate([&]{
@@ -1764,6 +2026,7 @@ bool ItlNativeControlOps::withdraw(Owner *owner){
     ++job->downCalls;const bool accepted=ItlNativeVirtualLink(owner,kIO80211NetworkLinkDown,1);
     const bool linked=owner->linkState()==kIO80211NetworkLinkDown;
     const bool ended=job->controller->awdlControlNativeEnd(job->epoch,serial);
+    if(ended)job->dropControlBsd();
     return accepted&&linked&&ended;
 }
 // Native BSD calls and network input run outside HAL/PM gates under the same
@@ -1786,15 +2049,20 @@ void ItlNativeControlCallout::discoveryPump(){
         if(!ready&&hal&&hal->awdlNativeSearch.matches(epoch))hal->awdlNativeDiscoveryStop();
     });
     if(discoveryBound&&!ready){
+        // Media availability is distinct from IFF_RUNNING. Withdraw immediately,
+        // including when peer teardown must retry while retaining DMA ownership.
+        interface->reportLinkStatus(1,0);
         const auto serial=controller->awdlControlNativeBegin(epoch,false);
         if(!serial){gateFault=true;return;}
         ItlNativePeerOps peerOps;
-        const bool withdrawn=awdlNativePeer.idle()||(awdlNativePeer.owner==interface&&awdlNativePeer.stop(peerOps));
-        interface->setProperty("AWDLDiscoveryPeerWithdrawalResult",uint32_t(awdlNativePeer.absentResult),32);
-        interface->setProperty("AWDLDiscoveryPeerNoticeIdle",awdlNativePeer.idle());
+        bool withdrawn=true;int absentResult=0;
+        for(auto &peer:awdlDiscoveryPeers){const bool done=peer.idle()||(peer.owner==interface&&peer.stop(peerOps));
+            withdrawn&=done;if(peer.absentResult)absentResult=peer.absentResult;}
+        interface->setProperty("AWDLDiscoveryPeerWithdrawalResult",uint32_t(absentResult),32);
+        interface->setProperty("AWDLDiscoveryPeerNoticeIdle",withdrawn);
         if(!withdrawn){controller->awdlControlNativeEnd(epoch,serial);gateFault=true;return;}
         ops.withGate([&]{auto hal=OSDynamicCast(ItlIwm,controller->fHalService);
-            if(hal&&hal->awdlNativeDiscovery.epoch==epoch){hal->awdlNativeDiscovery.peerPublished=false;hal->awdlNativeDiscoveryPublish();}});
+            if(hal&&hal->awdlNativeDiscovery.epoch==epoch){for(auto &peer:hal->awdlNativeDiscovery.peers)peer.published=false;hal->awdlNativeDiscovery.updatePeers();hal->awdlNativeDiscoveryPublish();}});
         const bool running=interface->setRunningState(false)==0;
         ItlNativeBsdOps bsdOps;
         if(awdlNativeBsdBinding.owner==interface&&bsdOps.bound(interface)==awdlNativeBsdBinding.interface)
@@ -1833,7 +2101,11 @@ void ItlNativeControlCallout::discoveryPump(){
             auto hal=OSDynamicCast(ItlIwm,controller->fHalService);
             ok=hal&&!interface->isInactive()&&!interface->probeStopDone&&controller->awdlControlPermitsEnable()&&hal->awdlNativeDiscoveryReady()&&hal->awdlNativeDiscovery.open;
         });
+        // Rapport checks SIOCGIFMEDIA before attempting a local AWDL path.
+        // Publish only after the real backend, BSD binding and epoch checks pass.
+        if(ok)interface->reportLinkStatus(3,kItlDarwinWifiMedia);
         const bool ended=controller->awdlControlNativeEnd(epoch,serial);
+        if(!ok||!ended)interface->reportLinkStatus(1,0);
         interface->setProperty("AWDLDiscoveryBSDRunning",ok&&ended);
         if(!ok||!ended){
             discoveryFailed=true;
@@ -1843,27 +2115,29 @@ void ItlNativeControlCallout::discoveryPump(){
         }
     }
     if(!discoveryBound||!ready)return;
+    for(unsigned peerSlot=0;peerSlot<ItlAwdl::NativeDiscoverySession::PeerCapacity;++peerSlot){
+    auto &registration=awdlDiscoveryPeers[peerSlot];
     ItlAwdl::NativePeerKey peerKey;bool publishPeer=false;
     ops.withGate([&]{auto hal=OSDynamicCast(ItlIwm,controller->fHalService);if(!hal)return;
         auto &d=hal->awdlNativeDiscovery;
-        publishPeer=hal->awdlNativeDiscoveryReady()&&d.open&&!d.closed&&d.epoch==epoch&&d.peerPrepared&&!d.peerPublished;
-        if(publishPeer)peerKey=d.peerKey;
+        publishPeer=hal->awdlNativeDiscoveryReady()&&d.open&&!d.closed&&d.epoch==epoch&&d.peers[peerSlot].prepared&&!d.peers[peerSlot].published;
+        if(publishPeer)peerKey=d.peers[peerSlot].key;
     });
     if(publishPeer){
         const auto serial=controller->awdlControlNativeBegin(epoch,true);
         if(!serial){gateFault=true;return;}
         ItlNativePeerOps peerOps;
-        bool ok=awdlNativePeer.idle()&&awdlNativePeer.start(peerOps,interface,awdlNativeBsdBinding.interface,peerKey);
-        interface->setProperty("AWDLDiscoveryPeerPresentResult",uint32_t(awdlNativePeer.presentResult),32);
+        bool ok=registration.idle()&&registration.start(peerOps,interface,awdlNativeBsdBinding.interface,peerKey);
+        interface->setProperty("AWDLDiscoveryPeerPresentResult",uint32_t(registration.presentResult),32);
         ops.withGate([&]{auto hal=OSDynamicCast(ItlIwm,controller->fHalService);
             ok=ok&&!interface->isInactive()&&!interface->probeStopDone&&controller->awdlControlPermitsEnable()&&hal&&hal->awdlNativeDiscoveryReady()&&hal->awdlNativeDiscovery.open&&!hal->awdlNativeDiscovery.closed&&
-                hal->awdlNativeDiscovery.epoch==epoch&&hal->awdlNativeDiscovery.peerPrepared&&
-                hal->awdlNativeDiscovery.peerKey.generation==peerKey.generation&&hal->awdlNativeDiscovery.peerKey.epoch==peerKey.epoch&&
-                !memcmp(hal->awdlNativeDiscovery.peerKey.mac,peerKey.mac,6);
-            if(ok)hal->awdlNativeDiscovery.peerPublished=true;
+                hal->awdlNativeDiscovery.epoch==epoch&&hal->awdlNativeDiscovery.peers[peerSlot].prepared&&
+                hal->awdlNativeDiscovery.peers[peerSlot].key.generation==peerKey.generation&&hal->awdlNativeDiscovery.peers[peerSlot].key.epoch==peerKey.epoch&&
+                !memcmp(hal->awdlNativeDiscovery.peers[peerSlot].key.mac,peerKey.mac,6);
+            if(ok){hal->awdlNativeDiscovery.peers[peerSlot].published=true;hal->awdlNativeDiscovery.updatePeers();}
         });
         if(!ok){
-            if(awdlNativePeer.owner==interface)awdlNativePeer.stop(peerOps);
+            if(registration.owner==interface)registration.stop(peerOps);
             discoveryFailed=true;
             ops.withGate([&]{auto hal=OSDynamicCast(ItlIwm,controller->fHalService);if(hal){
                 ++hal->awdlNativeDiscovery.peerFailures;hal->awdlNativeDiscoveryStop();hal->awdlNativeSearch.fail(epoch,EIO);}});
@@ -1871,6 +2145,7 @@ void ItlNativeControlCallout::discoveryPump(){
         if(!controller->awdlControlNativeEnd(epoch,serial)){gateFault=true;return;}
         interface->setProperty("AWDLDiscoveryPeerReady",ok);
         if(!ok)return;
+    }
     }
     bool deliveredBatch=false;
     for(unsigned i=0;i<16;++i){
@@ -2841,6 +3116,14 @@ IOReturn AirportItlwm::setProperties(OSObject *properties) {
         if(!v||v->unsigned64BitValue()!=1||!c||c->unsigned64BitValue()>9||!e||
            ((c->unsigned64BitValue()==0||c->unsigned64BitValue()==3||c->unsigned64BitValue()==6||c->unsigned64BitValue()==7||c->unsigned64BitValue()==8)?e->unsigned64BitValue()==0:e->unsigned64BitValue()!=0))return kIOReturnBadArgument;
         if(!_fCommandGate)return kIOReturnNotReady;
+        if(c->unsigned32BitValue()==0){
+            auto hal=OSDynamicCast(ItlIwm,fHalService);
+            if(!hal)return kIOReturnNotReady;
+            __atomic_store_n(&hal->awdlHostSearchStopEpoch,e->unsigned64BitValue(),__ATOMIC_SEQ_CST);
+            __atomic_store_n(&hal->awdlHostSearchStopPending,1,__ATOMIC_SEQ_CST);
+            setProperty("AWDLNativeSearchStopPendingEpoch",e->unsigned64BitValue(),64);
+            return kIOReturnSuccess;
+        }
         struct Request{uint32_t command;uint64_t epoch;}request{c->unsigned32BitValue(),e->unsigned64BitValue()};
         return _fCommandGate->runAction([](OSObject *object,void *arg,void*,void*,void*)->IOReturn{
             auto self=static_cast<AirportItlwm *>(object);auto request=static_cast<Request *>(arg);

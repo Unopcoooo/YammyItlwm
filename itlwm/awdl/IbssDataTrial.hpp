@@ -201,4 +201,13 @@ template<class State> bool lateRecoveryRetired(const State &s){
   s.resetProven&&!s.ownsRadio&&!s.resetRequested&&!s.operation&&!s.ordinary.active()&&
   s.commandAuthority.idle()&&!s.session.resources.valid()&&!s.session.commandInFlight&&!s.session.needsReset;
 }
+// A watchdog can terminate an otherwise clean session after the ordinary
+// station is restored. This permits one new explicit epoch, never an active retry.
+template<class State,class Control> bool terminalDataTrialReusable(const State &s,const Control &c){
+ return s.phase==decltype(s.phase)::Associated&&s.resetProven&&!s.ownsRadio&&!s.resetRequested&&
+  !s.operation&&!s.ordinary.active()&&s.commandAuthority.idle()&&!s.primaryError&&!s.recoveryError&&
+  !s.session.resources.valid()&&!s.session.commandInFlight&&!s.session.needsReset&&
+  c.phase==decltype(c.phase)::Failed&&c.reason==9&&!c.port&&!c.schedule.pending&&
+  c.submitted==c.completed&&c.schedule.submitted==c.submitted&&c.schedule.completed==c.completed;
+}
 }

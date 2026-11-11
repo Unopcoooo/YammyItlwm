@@ -8,10 +8,26 @@ inline bool nativePeerIdentity(const uint8_t mac[6],const uint8_t ip[16]) {
  const uint8_t iid[8]={uint8_t(mac[0]^2),mac[1],mac[2],0xff,0xfe,mac[3],mac[4],mac[5]};
  return memcmp(ip+8,iid,8)==0;
 }
+inline bool nativePeerIpv6FromMac(const uint8_t mac[6],uint8_t ip[16]) {
+ if(!mac||!ip||!dataUnicast(mac))return false;
+ const uint8_t link[]={0xfe,0x80,0,0,0,0,0,0,
+  uint8_t(mac[0]^2),mac[1],mac[2],0xff,0xfe,mac[3],mac[4],mac[5]};
+ memcpy(ip,link,sizeof(link));return true;
+}
 struct NativePeerKey {
  uint8_t mac[6]={},ip[16]={};uint32_t generation=0,epoch=0;
  bool valid()const{return generation&&epoch&&nativePeerIdentity(mac,ip);}
 };
+inline bool nativePeerProbeFrame(const NativePeerKey &key,const uint8_t local[6],
+ uint16_t wifiSequence,uint16_t awdlSequence,uint8_t *frame,size_t capacity,size_t &length) {
+ uint8_t localIp[16],eth[54]={};
+ if(!key.valid()||!nativePeerIpv6FromMac(local,localIp))return false;
+ memcpy(eth,key.mac,6);memcpy(eth+6,local,6);eth[12]=0x86;eth[13]=0xdd;
+ eth[14]=0x60;eth[20]=59;eth[21]=64;
+ memcpy(eth+22,localIp,16);memcpy(eth+38,key.ip,16);
+ return encodeData(eth,sizeof(eth),local,wifiSequence,awdlSequence,frame,capacity,length)==
+  DataError::Ok;
+}
 // Node notice completion is not proof of route ownership or removal. The
 // explicit experiment requires an empty scoped mapping on admission and
 // independent kernel-table readback after withdrawal.

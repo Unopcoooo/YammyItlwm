@@ -84,16 +84,17 @@ IOReturn ItlIwm::awdlNativeSearchEnable(){
 }
 void ItlIwm::awdlNativeSearchPublish(){
  if(!getMainWorkLoop()||!getMainWorkLoop()->inGate()||!getController())return;
- auto d=OSDictionary::withCapacity(20);if(!d)return;
+ auto d=OSDictionary::withCapacity(23);if(!d)return;
  using D=ItlIbss::ExperimentObservation;const auto &o=awdlNativeSearch;
- const char *keys[]={"Version","Epoch","WorkerEpoch","Phase","Generation","StartNs","DeadlineNs","StopRequested","Expired","Configured","Failure","WorkerPending","RecoveryState","RecoveryStableMs","PrimaryError","RecoveryError","RecoveryFaults","RecoveryGapCount","ControlRowsLost","BackendEnabled"};
+ const char *keys[]={"Version","Epoch","WorkerEpoch","Phase","Generation","StartNs","DeadlineNs","StopRequested","StopReason","DataPortOwner","DataPortReleasePending","Expired","Configured","Failure","WorkerPending","RecoveryState","RecoveryStableMs","PrimaryError","RecoveryError","RecoveryFaults","RecoveryGapCount","ControlRowsLost","BackendEnabled"};
  const uint64_t values[]={1,o.epoch,awdlIbssWorkerEpoch,uint32_t(o.phase),o.generation,o.startNs,o.deadlineNs,
-  o.stopRequested,o.expired,o.configuredOnce,uint32_t(o.failure),awdlIbssWorkPending,
+  o.stopRequested,o.stopReason,ItlAwdl::gDataPort.owner!=nullptr,ItlAwdl::gDataPort.releasePending,
+  o.expired,o.configuredOnce,uint32_t(o.failure),awdlIbssWorkPending,
   awdlProbeCounters?awdlProbeCounters->ibss.get(D::RecoveryState):0,awdlProbeCounters?awdlProbeCounters->ibss.get(D::RecoveryStableMs):0,
   awdlProbeCounters?awdlProbeCounters->ibss.get(D::PrimaryError):0,awdlProbeCounters?awdlProbeCounters->ibss.get(D::RecoveryError):0,
   awdlProbeCounters?awdlProbeCounters->ibss.get(D::RecoveryFaults):0,awdlProbeCounters?awdlProbeCounters->ibss.get(D::RecoveryGapCount):0,
   awdlProbeCounters?awdlProbeCounters->ibss.control.lost:0,awdlNativeSearchEnabled()};
- bool ok=true;for(unsigned i=0;i<20&&ok;++i){auto n=OSNumber::withNumber(values[i],64);if(!n){ok=false;break;}ok=d->setObject(keys[i],n);n->release();}
+ bool ok=true;for(unsigned i=0;i<23&&ok;++i){auto n=OSNumber::withNumber(values[i],64);if(!n){ok=false;break;}ok=d->setObject(keys[i],n);n->release();}
  if(ok)getController()->setProperty("AWDLNativeSearch",d);d->release();
 }
 IOReturn ItlIwm::awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch,bool receiveValidation){
@@ -101,15 +102,46 @@ IOReturn ItlIwm::awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch,bool r
  auto &o=awdlNativeSearch;auto &s=awdlIbssExclusive;using D=ItlIbss::ExperimentObservation;
  if(stop){
   if(expectedEpoch&&expectedEpoch!=o.epoch)return kIOReturnNotReady;
-  if(o.active()){o.stop(o.epoch);getMainCommandGate()->commandWakeup(&awdlIbssWorkPending,false);}
+  if(o.active()){
+   o.stop(o.epoch,1);getMainCommandGate()->commandWakeup(&awdlIbssWorkPending,false);
+  }
   awdlNativeSearchPublish();return kIOReturnSuccess;
  }
  if(expectedEpoch)return kIOReturnBadArgument;
+ __atomic_store_n(&awdlHostSearchStopPending,0,__ATOMIC_SEQ_CST);
  auto &late=awdlProbeCounters->ibss.lateAdmission;
+ auto &previous=awdlProbeCounters->ibss;
+ const auto &control=awdlNativeControlTx;
+ const bool noControlHistory=control.epoch==0&&control.phase==ItlAwdl::NativeSearchControlTx::Idle&&
+  !control.port&&!control.schedule.pending&&!control.submitted&&!control.completed;
  const bool lateCandidate=o.epoch&&o.configuredOnce&&awdlNativeDiscovery.used&&o.phase==ItlAwdl::NativeSearchOwner::Phase::Failed&&!o.failure&&
   ItlIbss::lateRecoveryRetired(s)&&
-  (awdlProbeCounters->ibss.recovery.phase==ItlIbss::StaRecoveryPhase::NotStable||
-   awdlProbeCounters->ibss.recovery.phase==ItlIbss::StaRecoveryPhase::StableAtDeadline);
+  (previous.recovery.phase==ItlIbss::StaRecoveryPhase::NotStable||
+   previous.recovery.phase==ItlIbss::StaRecoveryPhase::StableAtDeadline);
+ const bool terminalCandidate=o.epoch&&o.configuredOnce&&awdlNativeDiscovery.used&&
+  o.phase==ItlAwdl::NativeSearchOwner::Phase::Failed&&o.failure==EIO&&o.stopRequested&&
+  awdlNativeDiscovery.canRearm(o.epoch)&&previous.recovery.phase==ItlIbss::StaRecoveryPhase::StableAtDeadline&&
+  ItlIbss::terminalDataTrialReusable(s,awdlNativeControlTx)&&
+  !previous.control.lost&&!previous.get(D::RecoveryFaults)&&!previous.get(D::RecoveryGapCount);
+ const bool cleanFailureCandidate=ItlAwdl::cleanFailedSearchRetired(o,
+   (awdlNativeDiscovery.canRearm(o.epoch)||
+    (noControlHistory&&awdlNativeDiscovery.canRearmData(o.epoch)))&&
+   ItlIbss::recoveredDataTrialReusable(s),
+   (previous.recovery.phase==ItlIbss::StaRecoveryPhase::Idle||
+    previous.recovery.phase==ItlIbss::StaRecoveryPhase::StableAtDeadline)&&
+   !previous.control.lost&&!previous.get(D::RecoveryFaults)&&!previous.get(D::RecoveryGapCount));
+ // A sleep closes the infrastructure link without a host stop. On wake the
+ // search can fail with EIO after its exclusive image has already cancelled.
+ // Re-admit only after every radio, queue, peer and control owner is idle.
+ const bool staleCancelledAfterWake=o.epoch&&o.configuredOnce&&
+  o.phase==ItlAwdl::NativeSearchOwner::Phase::Failed&&o.failure==EIO&&!o.stopRequested&&!o.expired&&
+  awdlNativeDiscovery.canRearm(o.epoch)&&
+  s.phase==ItlIbss::ExclusivePhase::Cancelled&&s.resetProven&&!s.ownsRadio&&!s.operation&&!s.resetRequested&&
+  s.commandAuthority.idle()&&!s.ordinary.active()&&!s.primaryError&&!s.recoveryError&&
+  !s.session.resources.valid()&&!s.session.commandInFlight&&!s.session.needsReset&&
+  !control.port&&!control.schedule.pending&&control.submitted==control.completed&&
+  !previous.control.lost&&!previous.get(D::RecoveryFaults)&&!previous.get(D::RecoveryGapCount);
+ const bool rearmCandidate=lateCandidate||terminalCandidate||cleanFailureCandidate||staleCancelledAfterWake;
  // Keep this proof isolated from earlier diagnostics for the entire HAL lifetime.
  // Boot configuration is not ownership: only an untouched, unarmed template may be displaced.
  const bool dormantTemplate=awdlTemplateTxEnabled&&ItlAwdl::gEngine.modeEnabled&&
@@ -126,24 +158,27 @@ IOReturn ItlIwm::awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch,bool r
   }
   return kIOReturnNotReady;
  };
- if((!o.reusable()&&!lateCandidate)||awdlIbssWorkPending)return reject(1);
+ if((!o.reusable()&&!rearmCandidate)||awdlIbssWorkPending)return reject(1);
  if(itlIbssDataTrial.everArmed||awdlBatch.enabled||awdlBatch.active())return reject(2);
  if(awdlIbssTxPort||awdlIbssPeerActive())return reject(3);
  if(!awdlProbeEnabled||awdlDiscoveryEnabled)return reject(4);
  if(((awdlTemplateTxEnabled||ItlAwdl::gEngine.modeEnabled)&&!dormantTemplate)||ItlAwdl::gEngine.running)return reject(5);
  if(ItlAwdl::gSingleDataProbe.pending)return reject(6);
  if(!awdlIbssNativeStartIdle())return reject(7);
- auto &previous=awdlProbeCounters->ibss;
  if(!o.epoch){
   if(awdlIbssOneShot.armed||!ItlIbss::untouchedDataTrialReusable(s)||previous.recovery.phase!=ItlIbss::StaRecoveryPhase::Idle)return reject(8);
- }else if(!lateCandidate&&(!ItlIbss::recoveredDataTrialReusable(s)||previous.recovery.phase!=ItlIbss::StaRecoveryPhase::StableAtDeadline))return reject(9);
+ }else if(!lateCandidate&&!terminalCandidate&&!cleanFailureCandidate&&!staleCancelledAfterWake&&
+    (!ItlIbss::recoveredDataTrialReusable(s)||previous.recovery.phase!=ItlIbss::StaRecoveryPhase::StableAtDeadline))return reject(9);
  if(previous.control.lost||previous.get(D::RecoveryFaults))return reject(10);
  ItlIbssExclusiveTransport transport{this};
  const bool repeat=awdlNativeDiscovery.used||awdlNativeControlTx.phase!=ItlAwdl::NativeSearchControlTx::Idle;
  if(repeat){
   const auto &tx=awdlNativeControlTx;
-  if(!awdlNativeDiscovery.canRearm(o.epoch)||tx.epoch!=o.epoch||!tx.reusableTerminal()||
-     tx.port||tx.schedule.pending||tx.submitted!=tx.completed||o.failure)return reject(14);
+  if(!(awdlNativeDiscovery.canRearm(o.epoch)||
+       (noControlHistory&&awdlNativeDiscovery.canRearmData(o.epoch)))||
+     (!noControlHistory&&tx.epoch!=o.epoch)||
+     (!noControlHistory&&!tx.reusableTerminal()&&!terminalCandidate&&!staleCancelledAfterWake)||
+     tx.port||tx.schedule.pending||tx.submitted!=tx.completed||(!terminalCandidate&&!staleCancelledAfterWake&&o.failure))return reject(14);
  }
  if(!transport.canBegin())return reject(11);
  if(!transport.administrativelyUp())return reject(12);
@@ -158,7 +193,7 @@ IOReturn ItlIwm::awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch,bool r
  if(timerResult!=kIOReturnSuccess){counters->release();return timerResult;}
  auto reserved=awdlIbssWorkerPrepare();if(!reserved){counters->release();return kIOReturnNoResources;}
  auto job=static_cast<ItlIbssWorkerRequest*>(reserved);auto next=o;
- if(lateCandidate)next.phase=ItlAwdl::NativeSearchOwner::Phase::Cancelled;
+ if(rearmCandidate)next.phase=ItlAwdl::NativeSearchOwner::Phase::Cancelled;
  if(!next.commit(job->epoch,ItlAwdl::gDataPort.registeredLocal,itlAwdlRocNowNs(),ItlAwdl::nativeReceiveLimit(receiveValidation),receiveValidation)){
   awdlIbssWorkerDiscard(reserved);counters->release();return kIOReturnBadArgument;
  }
@@ -166,7 +201,7 @@ IOReturn ItlIwm::awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch,bool r
  if(!awdlIbssWorkerSubmit(reserved)){awdlIbssWorkerDiscard(reserved);counters->release();return kIOReturnNotReady;}
  if(dormantTemplate){awdlRocChannel=0;awdlTemplateTxEnabled=false;awdlAuxTxEnabled=false;ItlAwdl::gEngine.modeEnabled=0;}
  if(repeat){
-  const bool sameMaster=awdlNativeControlTx.nativeRoleAccepted && awdlNativeControlTx.periodic &&
+  const bool sameMaster=!staleCancelledAfterWake&&awdlNativeControlTx.nativeRoleAccepted && awdlNativeControlTx.periodic &&
       awdlNativeDiscovery.owner==reinterpret_cast<uintptr_t>(ItlAwdl::gDataPort.owner) &&
       !memcmp(awdlNativeDiscovery.local,next.local,6);
   awdlNativeDiscovery.resetAfterRetirement();
@@ -175,6 +210,7 @@ IOReturn ItlIwm::awdlNativeSearchRequest(bool stop,uint64_t expectedEpoch,bool r
  }else{
   awdlNativeControlTx.resumePriorMaster=false; // An unused grant belongs to its first successor only.
  }
+ awdlNativeSyncRequested=false;
  o=next;if(lateCandidate){s.primaryError=0;s.lastError=0;}s.phase=ItlIbss::ExclusivePhase::Idle;s.resetProven=false;s.generation=0;s.deadline=s.recoveryDeadline=0;
  auto old=awdlProbeCounters;__atomic_store_n(&awdlProbeCounters,counters,__ATOMIC_SEQ_CST);
  // Registry publication is diagnostic, not the acceptance or ready contract.
@@ -188,8 +224,14 @@ void ItlIwm::awdlNativeSearchTick(uint64_t epoch){
     epoch!=awdlIbssWorkerEpoch||!awdlNativeSearch.matches(epoch)||!awdlNativeSearch.active())return;
  using P=ItlAwdl::NativeSearchOwner::Phase;using E=ItlIbss::ExclusivePhase;using D=ItlIbss::ExperimentObservation;
  auto &o=awdlNativeSearch;auto &s=awdlIbssExclusive;auto &d=awdlProbeCounters->ibss;
+ if(__atomic_exchange_n(&awdlHostSearchStopPending,0,__ATOMIC_SEQ_CST)) {
+  const uint64_t requested=__atomic_load_n(&awdlHostSearchStopEpoch,__ATOMIC_SEQ_CST);
+  if(requested==epoch)o.stop(epoch,1);
+ }
  o.expire(epoch,itlAwdlRocNowNs());
- if(!ItlAwdl::gDataPort.owner||ItlAwdl::gDataPort.releasePending||memcmp(o.local,ItlAwdl::gDataPort.registeredLocal,6))o.stop(epoch);
+ if(!ItlAwdl::gDataPort.owner)o.stop(epoch,2);
+ else if(ItlAwdl::gDataPort.releasePending)o.stop(epoch,3);
+ else if(memcmp(o.local,ItlAwdl::gDataPort.registeredLocal,6))o.stop(epoch,4);
  if(o.phase==P::Starting){
   ItlIbssExclusiveTransport transport{this};
   if(!transport.administrativelyUp())o.fail(epoch,ECANCELED);
@@ -198,7 +240,9 @@ void ItlIwm::awdlNativeSearchTick(uint64_t epoch){
    const auto now=transport.now();int error=now<o.deadlineNs?awdlIbssExclusiveBegin(o.deadlineNs-now):ETIMEDOUT;
    if(dmaDetaching||!awdlIbssTimer||epoch!=awdlIbssWorkerEpoch)return;
    d.set(D::BeginError,uint32_t(error));
-   if(!ItlAwdl::gDataPort.owner||ItlAwdl::gDataPort.releasePending||memcmp(o.local,ItlAwdl::gDataPort.registeredLocal,6))o.stop(epoch);
+   if(!ItlAwdl::gDataPort.owner)o.stop(epoch,2);
+   else if(ItlAwdl::gDataPort.releasePending)o.stop(epoch,3);
+   else if(memcmp(o.local,ItlAwdl::gDataPort.registeredLocal,6))o.stop(epoch,4);
    if(!ItlIbss::untouchedDataTrialReusable(s))o.recordEntered(epoch,s.generation?s.generation:uint32_t(com.sc_generation));
    if(error)o.fail(epoch,error);
    else if(s.phase==E::FirmwareReady){
@@ -206,7 +250,9 @@ void ItlIwm::awdlNativeSearchTick(uint64_t epoch){
     if(o.phase==P::Starting){
      d.arm(s.generation,s.session.resources.mac,itlAwdlRocNowNs(),s.deadline);d.set(D::TargetChannel,0);
      error=awdlIbssCandidateConfigure();if(dmaDetaching||!awdlIbssTimer||epoch!=awdlIbssWorkerEpoch)return;
-     if(!ItlAwdl::gDataPort.owner||ItlAwdl::gDataPort.releasePending||memcmp(o.local,ItlAwdl::gDataPort.registeredLocal,6))o.stop(epoch);
+     if(!ItlAwdl::gDataPort.owner)o.stop(epoch,2);
+     else if(ItlAwdl::gDataPort.releasePending)o.stop(epoch,3);
+     else if(memcmp(o.local,ItlAwdl::gDataPort.registeredLocal,6))o.stop(epoch,4);
      d.set(D::ConfigureError,uint32_t(error));d.set(D::ConfigurationCompleted,!error&&s.session.quotaConfigured);
      o.expire(epoch,itlAwdlRocNowNs());
      if(error)o.fail(epoch,error);else if(!s.session.quotaConfigured)o.fail(epoch,EIO);
@@ -242,3 +288,4 @@ void ItlIwm::awdlNativeSearchTick(uint64_t epoch){
  }
  awdlNativeSearchPublish();
 }
+

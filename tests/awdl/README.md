@@ -1,14 +1,8 @@
-# AWDL tests and historical observer notes
+# Beta r26 host tests
 
-This directory now contains offline tests for parsers, synchronization, data
-framing, session queues and runtime/lifecycle models. Passing these tests does
-not establish radio interoperability, Finder discovery or file-transfer success.
-See the [hardware test record](../../docs/awdl-preview.md) and
-[current version status](../../docs/awdl-status.md) for those claims.
+Run `python3 scripts/test-awdl-beta.py` from the repository root with Xcode command-line tools. Twelve programs are compiled and run with ASan/UBSan (24 compile/run records). Fixtures are included in `fixtures/`; no development-machine paths are needed. These validate protocol/runtime logic, not live radio behavior or other hardware compatibility.
 
-The notes below document the early RX-observer experiments only. Statements
-such as “not an AWDL implementation” and “awaiting boot validation” describe
-those historical builds, not the present source preview as a whole.
+The sections below describe historical observer experiments and their original scope; their “not implemented/not tested” statements do not describe current Beta r26.
 
 ---
 

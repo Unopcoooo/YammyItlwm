@@ -5,7 +5,8 @@
 static bool itlNativeSearchPeerOwned(ItlIwm *);
 static bool itlNativeSearchPeerMayTransmit(ItlIwm *,const ItlIbss::PeerGrant &);
 static bool itlNativeSearchPeerComplete(ItlIwm *,uint32_t,unsigned,unsigned,uint32_t);
-static void itlNativeSearchPeerStopped(ItlIwm *);
+struct ItlIbssPeerPort;
+static void itlNativeSearchPeerStopped(ItlIwm *,ItlIbssPeerPort *);
 static bool itlIbssPeerReplyWindowOpen(ItlIwm *,uint32_t,uint64_t);
 static void itlIbssApplyObservedCapabilities(ItlIwm *,ItlIbss::PeerGrant &,unsigned);
 static bool itlIbssNativeComplete(ItlIwm *,uint32_t,unsigned,unsigned,uint32_t);
@@ -38,7 +39,7 @@ struct ItlIbssPeerPort {
  ItlIbss::PeerCommands<CommandTransport> commands;
  ItlIbss::PeerDataTx<ItlIbssPeerPort> data;
  unsigned rejection=0,nativeWindowReason=0,dmaEvidenceSamples=0;
- size_t requestLength=0;
+ size_t requestLength=0;uint8_t softwareRetries=0;
  uint32_t noticeSlot=0,noticeLength=0,noticeCount=0,noticeSsn=UINT32_MAX,noticeStatus=UINT32_MAX;
  mbuf_t held=nullptr;unsigned calls=0;bool stopEvidence=false,retiring=false,mismatch=false;
  explicit ItlIbssPeerPort(ItlIwm *h):hal(h),commands(commandTransport,peer),data(*this,peer){}
@@ -68,7 +69,7 @@ struct ItlIbssPeerPort {
   if(!rejection){rejection=stage;if(inGate())hal->awdlIbssExperimentEvent(41,stage,int(detail),hal->com.agg_queue_mask,hal->com.sc_flags);}
   return false;
  }
- bool reserve(const uint8_t *frame,size_t length){
+ bool reserve(const uint8_t *frame,size_t length,unsigned station=5,int selectedQueue=-1,uint32_t ownedQueues=0){
   if(!inGate())return reject(1);
   if(hal->getMainWorkLoop()->onThread())return reject(2);
   const auto guard=ItlIbssTxPort::radioRejection(hal,true);if(guard)return reject(3,guard);
@@ -76,14 +77,15 @@ struct ItlIbssPeerPort {
   auto sc=&hal->com;const auto &s=hal->awdlIbssExclusive.session;
   // reserveFresh + command authority establish the complete fresh inventory.
   if(s.resources.mac!=1||s.resources.phy!=1||s.resources.tsf!=1||s.resources.mcastSta!=3||s.resources.bcastSta!=4)return reject(5);
-  if(sc->agg_queue_mask)return reject(6,sc->agg_queue_mask);
+  if(sc->agg_queue_mask&~ownedQueues)return reject(6,sc->agg_queue_mask);
   if(hal->awdlIbssTxPort&&!hal->awdlIbssManagementDrained())return reject(7);
   if(memcmp(frame+10,s.mac.source,6))return reject(8);
   if(memcmp(frame+16,s.mac.bssid,6))return reject(9);
   reserved.base=s.resources;reserved.generation=generation();reserved.color=s.mac.color;
-  memcpy(reserved.local,frame+10,6);memcpy(reserved.peer,frame+4,6);reserved.station=5;
+  memcpy(reserved.local,frame+10,6);memcpy(reserved.peer,frame+4,6);reserved.station=uint8_t(station);
   unsigned firstBad=0;
   for(unsigned q=IWM_FIRST_AGG_TX_QUEUE;q<=IWM_LAST_AGG_TX_QUEUE;++q){
+   if((ownedQueues&(1u<<q))||(selectedQueue>=0&&q!=unsigned(selectedQueue)))continue;
    auto r=&sc->txq[q];unsigned bad=(!r->desc?1u:0u)|(!r->cmd?2u:0u)|(r->queued?4u:0u)|(r->cur!=r->tail?8u:0u);
    unsigned badSlot=0;
    if(!bad)for(unsigned i=0;i<IWM_TX_RING_COUNT;++i){const auto &d=r->data[i];bad=(d.m?16u:0u)|(d.in?32u:0u)|(!d.map?64u:0u)|(!d.cmd_paddr?128u:0u)|(!d.scratch_paddr?256u:0u);if(bad){badSlot=i;break;}}
@@ -193,6 +195,16 @@ struct ItlIbssPeerPort {
 };
 // Global port avoids changing ItlIwm's ABI layout. All access is on its main gate.
 static ItlIbssPeerPort *itlIbssPeerPort=nullptr;
+static ItlIbssPeerPort *itlDiscoveryPeerPorts[ItlAwdl::NativeDiscoverySession::PeerCapacity]={};
+static ItlIbssPeerPort *itlDiscoveryPeerPort(ItlIwm *h,const uint8_t *mac){
+ for(auto p:itlDiscoveryPeerPorts)if(p&&p->hal==h&&!memcmp(p->reserved.peer,mac,6))return p;return nullptr;
+}
+static ItlIbssPeerPort *itlDiscoveryPeerQueue(ItlIwm *h,unsigned queue){
+ for(auto p:itlDiscoveryPeerPorts)if(p&&p->hal==h&&p->reserved.queue==queue)return p;return nullptr;
+}
+static_assert(ItlAwdl::NativePeerInventory::FirstQueue==IWM_FIRST_AGG_TX_QUEUE&&
+ ItlAwdl::NativePeerInventory::QueueEnd==IWM_LAST_AGG_TX_QUEUE+1&&
+ ItlAwdl::NativePeerInventory::StationEnd==IWM_STATION_COUNT,"inventory matches initialized resources");
 static bool itlIbssPeerNext(ItlIwm *hal,const uint8_t *frame,size_t length){
  auto p=itlIbssPeerPort;
  if(!p||p->hal!=hal||!p->onWorker()||p->retiring||p->calls||
@@ -205,32 +217,62 @@ static void itlIbssPeerFinish(ItlIbssPeerPort *p){
  if(!p||!p->retiring||p->calls)return;
  p->data.hardwareStopped();p->commands.hardwareStopped();
  if(p->held||p->data.pending()||(p->peer.everUsed&&!p->peer.released))return;
- itlIbssPeerPort=nullptr;delete p;
+ if(itlIbssPeerPort==p)itlIbssPeerPort=nullptr;
+ for(auto &slot:itlDiscoveryPeerPorts)if(slot==p)slot=nullptr;delete p;
 }
-bool ItlIwm::awdlIbssPeerActive(){return itlIbssPeerPort&&itlIbssPeerPort->hal==this;}
+bool ItlIwm::awdlIbssPeerActive(){
+ if(itlIbssPeerPort&&itlIbssPeerPort->hal==this)return true;
+ for(auto p:itlDiscoveryPeerPorts)if(p&&p->hal==this)return true;return false;
+}
 bool ItlIwm::awdlIbssPeerPrepare(const uint8_t *frame,size_t length){
  ItlAwdlRocLifetime lifetime(this,getMainCommandGate(),getMainWorkLoop());
- if(!getMainWorkLoop()->inGate())return false;
- if(getMainWorkLoop()->onThread()||dmaDetaching||itlIbssPeerPort||(awdlIbssTxPort&&!awdlIbssManagementDrained())){awdlIbssExperimentEvent(41,16,EBUSY,0,0);return false;}
- auto p=new ItlIbssPeerPort(this);if(!p){awdlIbssExperimentEvent(41,13,ENOMEM,0,0);return false;}
- if(length>sizeof(p->request)){p->reject(12,unsigned(length));delete p;return false;}
- if(!p->reserve(frame,length)){delete p;return false;}
- itlIbssApplyObservedCapabilities(this,p->reserved,iwm_mimo_enabled(&com)?2:1);
- memcpy(p->request,frame,length);
- itlIbssPeerPort=p;++p->calls;
- const int error=p->commands.create(p->reserved);const bool submitted=!error&&p->peer.ready&&!p->retiring;
+ if(!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread()||dmaDetaching||!frame||
+    !ItlAwdl::ibssDataHeaderLength(frame,length)||itlIbssPeerPort||(awdlIbssTxPort&&!awdlIbssManagementDrained()))return false;
+ auto &s=awdlNativeDiscovery;const int slot=s.open&&!s.closed?s.peerIndex(frame+4):-1;
+ const bool multi=slot>=0&&s.peers[slot].preparing;
+ if(!multi&&awdlIbssPeerActive())return false;
+ if(multi&&itlDiscoveryPeerPorts[slot])return false;
+ uint32_t owned=0;
+ for(auto p:itlDiscoveryPeerPorts)if(p){
+  if(!multi||p->hal!=this||p->reserved.generation!=uint32_t(com.sc_generation))return false;
+  owned|=1u<<p->reserved.queue;
+ }
+ auto p=new ItlIbssPeerPort(this);if(!p)return false;
+ if(length>sizeof(p->request)){delete p;return false;}
+ const ItlAwdl::NativePeerInventory::Entry *entry=nullptr;
+ if(multi){
+  if(!s.inventory.begun){
+   const auto &r=awdlIbssExclusive.session.resources;
+   if(owned||com.agg_queue_mask||!r.valid()||r.mac!=1||r.phy!=1||r.tsf!=1||r.mcastSta!=3||r.bcastSta!=4){delete p;return false;}
+   uint32_t freeQueues=0;
+   for(unsigned q=IWM_FIRST_AGG_TX_QUEUE;q<=IWM_LAST_AGG_TX_QUEUE;++q){auto ring=&com.txq[q];
+    bool free=ring->desc&&ring->cmd&&com.sched_dma.vaddr&&!ring->queued&&ring->cur==ring->tail;
+    for(unsigned j=0;free&&j<IWM_TX_RING_COUNT;++j){const auto &d=ring->data[j];free=!d.m&&!d.in&&d.map&&d.cmd_paddr&&d.scratch_paddr;}
+    if(free)freeQueues|=1u<<q;
+   }
+   if(!s.inventory.begin(s.generation,s.peers[slot].key.epoch,0xffe0,freeQueues)){delete p;return false;}
+  }
+  entry=s.inventory.reserve(s.peers[slot].key);if(!entry){delete p;return false;}
+ }
+ if(!p->reserve(frame,length,entry?entry->station:5,entry?entry->queue:-1,owned)){delete p;return false;}
+ itlIbssApplyObservedCapabilities(this,p->reserved,iwm_mimo_enabled(&com)?2:1);memcpy(p->request,frame,length);
+ if(multi)itlDiscoveryPeerPorts[slot]=p;else itlIbssPeerPort=p;
+ ++p->calls;const int error=p->commands.create(p->reserved);const bool submitted=!error&&p->peer.ready&&!p->retiring;
  if(submitted)p->requestLength=length;
  if(error||!submitted){p->reject(error?14:15,unsigned(error));p->peer.ready=false;awdlIbssExclusive.resetRequested=true;}
  --p->calls;itlIbssPeerFinish(p);return submitted;
 }
 bool ItlIwm::awdlIbssPeerSubmit(){
- auto p=itlIbssPeerPort;if(!p||p->hal!=this||!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread())return false;
+ auto &s=awdlNativeDiscovery;
+ auto p=s.peerFlight&&s.flightPeer<s.PeerCapacity?itlDiscoveryPeerPort(this,s.peers[s.flightPeer].key.mac):itlIbssPeerPort;
+ if(!p||p->hal!=this||!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread())return false;
  ++p->calls;const bool sent=!p->retiring&&p->data.start(p->request,p->requestLength,itlNativeSearchPeerOwned(this)&&awdlNativeSearch.receiveValidation());
  if(!sent)awdlIbssExperimentEvent(45,p->data.rejectionCode(),int(p->rejection),(p->retiring?1u:0u)|(p->peer.ready?2u:0u)|(p->peer.unknown?4u:0u)|(p->peer.dataUsed?8u:0u),unsigned(p->requestLength));
  --p->calls;itlIbssPeerFinish(p);return sent;
 }
 bool ItlIwm::awdlIbssPeerTxComplete(unsigned queue,unsigned slot,const void *payload,size_t length){
- auto p=itlIbssPeerPort;if(!p||p->hal!=this||queue!=p->reserved.queue)return false;
+ auto p=itlDiscoveryPeerQueue(this,queue);if(!p)p=itlIbssPeerPort;
+ if(!p||p->hal!=this||queue!=p->reserved.queue)return false;
  if(!getMainWorkLoop()->inGate())return true;
  // Includes duplicate/late notifications after drained peer removal.
  if(!p->data.pending())return true;
@@ -254,19 +296,28 @@ bool ItlIwm::awdlIbssPeerTxComplete(unsigned queue,unsigned slot,const void *pay
  --p->calls;itlIbssPeerFinish(p);return true;
 }
 void ItlIwm::awdlIbssPeerTick(){
- auto p=itlIbssPeerPort;if(!p||p->hal!=this||!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread())return;
- ++p->calls;p->data.tick();
- itlIbssNativeTick(this);
- // TX DMA can be reclaimed now, but firmware peer RX context must outlive the reply window.
- if(!p->retiring&&p->peer.dataUsed&&!p->data.pending()&&p->peer.ready&&
-    !itlIbssPeerReplyWindowOpen(this,p->reserved.generation,p->now())){const int e=p->commands.remove();if(e&&e!=EBUSY){p->peer.unknown=true;awdlIbssExclusive.resetRequested=true;}}
- --p->calls;itlIbssPeerFinish(p);
+ if(!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread())return;
+ auto tick=[&](ItlIbssPeerPort *p){if(!p||p->hal!=this)return;
+  ++p->calls;p->data.tick();if(p==itlIbssPeerPort)itlIbssNativeTick(this);
+  if(!p->retiring&&p->peer.dataUsed&&!p->data.pending()&&p->peer.ready&&
+     !itlIbssPeerReplyWindowOpen(this,p->reserved.generation,p->now())){const int e=p->commands.remove();if(e&&e!=EBUSY){p->peer.unknown=true;awdlIbssExclusive.resetRequested=true;}}
+  --p->calls;itlIbssPeerFinish(p);
+ };
+ tick(itlIbssPeerPort);for(auto p:itlDiscoveryPeerPorts)tick(p);
 }
 void ItlIwm::awdlIbssPeerCancel(){
- auto p=itlIbssPeerPort;if(!p||p->hal!=this||!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread())return;
- ++p->calls;itlIbssNativeStop(this,false);p->data.cancel();--p->calls;itlIbssPeerFinish(p);
+ if(!getMainWorkLoop()->inGate()||getMainWorkLoop()->onThread())return;
+ auto cancel=[&](ItlIbssPeerPort *p){if(!p||p->hal!=this)return;
+  ++p->calls;if(p==itlIbssPeerPort)itlIbssNativeStop(this,false);p->data.cancel();--p->calls;itlIbssPeerFinish(p);
+ };
+ cancel(itlIbssPeerPort);for(auto p:itlDiscoveryPeerPorts)cancel(p);
 }
 void ItlIwm::awdlIbssPeerStopped(){
- auto p=itlIbssPeerPort;if(!p||p->hal!=this||!getMainWorkLoop()->inGate())return;
- ++p->calls;p->retiring=true;p->stopEvidence=true;p->data.hardwareStopped();p->commands.hardwareStopped();itlNativeSearchPeerStopped(this);itlIbssNativeStop(this,p->stopProof(p->reserved));awdlIbssDataPortResult(true);--p->calls;itlIbssPeerFinish(p);
+ if(!getMainWorkLoop()->inGate())return;
+ auto stop=[&](ItlIbssPeerPort *p){if(!p||p->hal!=this)return;
+  ++p->calls;p->retiring=true;p->stopEvidence=true;p->data.hardwareStopped();p->commands.hardwareStopped();
+  itlNativeSearchPeerStopped(this,p);if(p==itlIbssPeerPort)itlIbssNativeStop(this,p->stopProof(p->reserved));
+  awdlIbssDataPortResult(true);--p->calls;itlIbssPeerFinish(p);
+ };
+ stop(itlIbssPeerPort);for(auto p:itlDiscoveryPeerPorts)stop(p);
 }

@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "NativeLinkAdvertisement.hpp"
+#include "EngineState.hpp"
+static void itlNativePublishAwWindow(ItlIwm *hal){
+ auto &t=hal->awdlNativeControlTx;
+ if(!t.nativeRoleAccepted||!t.epochHostNs||!t.epochGp2||!hal->awdlNativeSearch.active()||
+    !hal->awdlIbssExclusive.ownsRadio||hal->awdlIbssExclusive.operation||
+    !ItlAwdl::gEngine.availabilityWindowEvent)return;
+ if(!hal->iwm_nic_lock(&hal->com))return;
+ const uint32_t gp2=hal->iwm_read_prph(&hal->com,IWM_DEVICE_SYSTEM_TIME_REG);
+ hal->iwm_nic_unlock(&hal->com);
+ uint32_t startGp2=0;uint16_t awNumber=0;
+ if(!t.awWindow.observe(t.epochGp2,gp2,startGp2,awNumber))return;
+ ItlAwdl::gEngine.availabilityWindowEvent(ItlAwdl::gEngine.availabilityWindowContext,
+                                          true,startGp2,awNumber);
+}
 // Uses the retained search worker and the existing single-descriptor owner.
 void ItlIwm::awdlNativeControlTxPublish(){
  if(!getMainWorkLoop()->inGate()||!getController())return;
@@ -48,6 +62,7 @@ void ItlIwm::awdlNativeControlTxTick(){
   const bool cleared=t.port&&!awdlIbssTxPort;if(cleared)t.port=nullptr;
   if(cleared||t.nativeRoleAccepted)awdlNativeControlTxPublish();return;
  }
+ itlNativePublishAwWindow(this);
  if(t.nativeRoleAccepted&&!awdlNativeSyncRoleReady()){awdlNativeControlTxStop(1);return;}
  auto fail=[&](unsigned reason){awdlNativeControlTxStop(reason);awdlNativeSearch.fail(t.epoch,EIO);};
  if(!awdlNativeSearch.matches(t.epoch)||!awdlNativeSearchEnabled()||
@@ -82,6 +97,7 @@ void ItlIwm::awdlNativeControlTxTick(){
  if(after<before||after-before>2000000ULL){fail(8);return;}
  if(!t.submitted){t.epochGp2=gp2;t.epochHostNs=before+(after-before)/2;}
  ItlAwdl::SelfControlInput input;input.receiveValidation=awdlNativeSearch.receiveValidation();memcpy(input.source,awdlNativeSearch.local,6);
+ if(awdlNativeElectionValid&&awdlNativeElectionSelfMetric)input.selfMetric=awdlNativeElectionSelfMetric;
  if(t.periodic)input.advertisementPeriod=t.schedule.psfPeriodTu;
  input.subtype=t.periodic?0:(t.submitted?3:0);input.sequence=uint16_t(t.submitted);
  input.generation=t.generation;input.currentGeneration=uint32_t(com.sc_generation);

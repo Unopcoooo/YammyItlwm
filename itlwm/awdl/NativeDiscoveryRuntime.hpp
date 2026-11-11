@@ -2,6 +2,7 @@
 #pragma once
 #include "LengthRejectDiagnostic.hpp"
 #include "PeerMulticastWindow.hpp"
+#include "NativeTxTerminal.hpp"
 bool ItlIwm::awdlNativeDiscoveryReady(){
  if(!getMainWorkLoop()||!getMainWorkLoop()->inGate()||!awdlNativeSyncRoleConfirmed()||
     ItlIbssTxPort::radioRejection(this,true)||awdlIbssDataActive()||(awdlIbssPeerActive()&&!itlNativeSearchPeerOwned(this)))return false;
@@ -62,13 +63,17 @@ void ItlIwm::awdlNativeDiscoveryTick(){
    const bool done=awdlIbssManagementDrained();
    using D=ItlIbss::ExperimentObservation;const auto &d=awdlProbeCounters->ibss;
    // A flush reply alone is not DMA proof: require the matching TX completion and reclaim.
+   const bool lateSuccess=ItlAwdl::nativeTxLateSuccess(done,p->held,p->adapter.pending(),p->mismatch,
+    d.get(D::TxGeneration),uint32_t(com.sc_generation),d.get(D::TxCompleted),d.get(D::TxReclaimed),
+    d.get(D::TxStopReclaimed),d.get(D::TxDeadlineExpired),d.get(D::TxFlushFailed),
+    d.get(D::TxCancelled),d.get(D::TxMismatch),d.get(D::TxStatus));
    const bool expired=!done&&s.open&&!s.closed&&!awdlIbssExclusive.resetRequested&&p->hal==this&&!p->retiring&&!p->mismatch&&!p->held&&
     d.get(D::TxGeneration)==uint32_t(com.sc_generation)&&d.get(D::TxCompleted)==1&&
     d.get(D::TxReclaimed)==1&&!d.get(D::TxStopReclaimed)&&d.get(D::TxDeadlineExpired)==1&&
     d.get(D::TxFlushRequested)==1&&!d.get(D::TxFlushFailed)&&!d.get(D::TxCancelled)&&
     !d.get(D::TxMismatch)&&(d.get(D::TxStatus)&255)==IWM_TX_STATUS_FAIL_FIFO_FLUSHED;
-   s.state(s.inFlightRecord,done?s.Drained:expired?s.Expired:s.TransportFailed);s.inFlightRecord=0;
-   if(done)++s.completed;else if(expired)++s.expiredTx;
+   s.state(s.inFlightRecord,(done||lateSuccess)?s.Drained:expired?s.Expired:s.TransportFailed);s.inFlightRecord=0;
+   if(done||lateSuccess)++s.completed;else if(expired)++s.expiredTx;
    else{++s.failed;s.close();awdlNativeSearch.fail(s.epoch,EIO);}
    awdlIbssTxDispose();if(awdlIbssTxPort)return;s.port=nullptr;awdlNativeDiscoveryPublish();
   }
@@ -92,28 +97,29 @@ void ItlIwm::awdlNativeDiscoveryTick(){
     after>=model.modelHostNs && after-model.modelHostNs<=500000000ULL){
   const bool unicast=!(s.tx[s.txHead].bytes[0]&1);
   for(unsigned i=0;i<model.peers->count;++i)
-   if(!unicast||!memcmp(model.peers->peers[i].address,s.peerKey.mac,6))visit.consider(model.peers->peers[i],gp2);
+   if(!unicast||!memcmp(model.peers->peers[i].address,s.tx[s.txHead].bytes,6))visit.consider(model.peers->peers[i],gp2);
  }
  uint64_t close=0;
  const bool unicast=!(s.tx[s.txHead].bytes[0]&1);
- if(unicast&&(!s.peerPublished||!s.peerPrepared||!visit.peer)){s.waiting(s.Window);return;}
+ const int selected=unicast?s.peerIndex(s.tx[s.txHead].bytes):-1;
+ if(unicast&&(selected<0||!s.peers[selected].published||!s.peers[selected].prepared||!visit.peer)){s.waiting(s.Window);s.rotateTx();return;}
  if(visit.hasSchedule){
   // The local schedule advertises 6 in every EAW. Avoid local edges as well.
   constexpr uint32_t period=65536,guard=3072+2048;
   const uint32_t phase=elapsed%period;
-  if(!visit.peer || phase<guard || phase+2000>=period-guard || s.endNs<=after){s.waiting(s.Window);return;}
+  if(!visit.peer || phase<guard || phase+2000>=period-guard || s.endNs<=after){s.waiting(s.Window);s.rotateTx();return;}
   uint32_t span=period-guard-phase;
   if(visit.remaining<span)span=visit.remaining;
   const uint64_t ns=uint64_t(span)*1000;
   close=ns<s.endNs-after?after+ns:s.endNs;
-  if(close-after<=2000000){s.waiting(s.Window);return;}
- }else if(!ItlAwdl::NativeDiscoverySession::window(elapsed,after,s.endNs,close)){s.waiting(s.Window);return;}
+  if(close-after<=2000000){s.waiting(s.Window);s.rotateTx();return;}
+ }else if(!ItlAwdl::NativeDiscoverySession::window(elapsed,after,s.endNs,close)){s.waiting(s.Window);s.rotateTx();return;}
  ItlAwdl::NativeDiscoverySession::Packet packet;uint8_t id=0;
  if(!s.takeTx(after,packet,false,&id))return;
  uint8_t frame[ItlAwdl::kAwdlDataMax];size_t length=0;
  if(ItlAwdl::encodeData(packet.bytes,packet.length,s.local,s.wifiSequence,s.awdlSequence,frame,sizeof(frame),length)!=ItlAwdl::DataError::Ok){s.state(id,s.PrepareFailed);++s.rejected;return;}
  if(unicast){
-  if(!itlNativeSearchPeerSend(this,frame,length,id,after,close))return;
+  if(!itlNativeSearchPeerSend(this,frame,length,id,after,close,packet.softwareRetries))return;
   if(s.submitted<=16){s.txWindowPeer[s.submitted-1]=visit.peer;s.txWindowSlot[s.submitted-1]=uint8_t(visit.slot);
   s.txElapsed[s.submitted-1]=elapsed;}++s.peerWindowTx;awdlNativeDiscoveryPublish();return;
  }
@@ -125,7 +131,23 @@ void ItlIwm::awdlNativeDiscoveryTick(){
  p->record("AWDLIbssTxVersion",6);p->record("AWDLIbssTxGeneration",s.generation);
  s.port=p;awdlIbssTxPort=p;++p->calls;const bool sent=p->adapter.start(frame,length);--p->calls;
  if(sent){s.inFlightRecord=id;s.state(id,s.Submitted);s.repliesSubmitted+=s.dnsResponse(packet.bytes,packet.length);if(s.submitted<16){s.txWindowPeer[s.submitted]=visit.peer;s.txWindowSlot[s.submitted]=uint8_t(visit.slot);s.txElapsed[s.submitted]=elapsed;}s.peerWindowTx+=visit.peer!=0;++s.submitted;s.wifiSequence=uint16_t((s.wifiSequence+1)&4095);s.awdlSequence=uint16_t((s.awdlSequence+1)&4095);}
- else{s.state(id,s.TransportFailed);++s.failed;s.close();awdlNativeSearch.fail(s.epoch,EIO);}
+ else{
+  // rejection 28 is a channel-window miss.  It is not a transport failure:
+  // the descriptor was never published.  Return the copied BSD frame to the
+  // queue once for the next window instead of retiring the whole receive
+  // session and restoring ordinary Wi-Fi in the middle of AirDrop discovery.
+  const bool unpublishedWindowMiss=p->adapter.rejectionStage()==28&&!p->held&&!p->adapter.pending()&&!p->mismatch;
+  if(unpublishedWindowMiss){
+   const uint64_t current=itlAwdlRocNowNs();
+   const bool queued=s.retryFront(packet.bytes,packet.length,packet.softwareRetries,id,current);
+   s.state(id,queued?s.WindowMiss:s.RetryExhausted);
+   if(!queued)++s.failed;
+   s.port=nullptr;awdlIbssTxPort=nullptr;delete p;
+   if(!queued){s.close();awdlNativeSearch.fail(s.epoch,EIO);}
+  }else{
+   s.state(id,s.TransportFailed);++s.failed;s.close();awdlNativeSearch.fail(s.epoch,EIO);
+  }
+ }
  if(p->retiring)awdlIbssTxDispose();awdlNativeDiscoveryPublish();
 }
 void ItlIwm::awdlNativeDiscoveryPublish(){
@@ -139,9 +161,14 @@ void ItlIwm::awdlNativeDiscoveryPublish(){
   auto v=OSNumber::withNumber(s.peerTxResults[i],64);if(!v){ok=false;break;}
   ok=d->setObject(peerResultKeys[i],v);v->release();
  }
- const char *peerKeysStatus[]={"PeerPreparing","PeerPrepared","PeerPublished","PeerOutstanding","UnicastSubmitted","UnicastCompleted","UnicastFailed","UnicastDelivered","UnicastRetryExhausted"};
- const uint64_t peerValues[]={s.peerPreparing,s.peerPrepared,s.peerPublished,s.peerFlight,s.peerSubmitted,s.peerCompleted,s.peerFailures,s.peerDelivered,s.peerRetryExhausted};
+ const char *peerKeysStatus[]={"PeerPreparing","PeerPrepared","PeerPublished","PeerOutstanding","UnicastSubmitted","UnicastCompleted","UnicastFailed","UnicastDelivered","UnicastRetryExhausted","UnicastSoftwareRetries"};
+ const uint64_t peerValues[]={s.peerPreparing,s.peerPrepared,s.peerPublished,s.peerFlight,s.peerSubmitted,s.peerCompleted,s.peerFailures,s.peerDelivered,s.peerRetryExhausted,s.peerSoftwareRetries};
  for(unsigned i=0;i<sizeof(peerValues)/sizeof(peerValues[0])&&ok;++i){auto v=OSNumber::withNumber(peerValues[i],64);if(!v){ok=false;break;}ok=d->setObject(peerKeysStatus[i],v);v->release();}
+ unsigned peerCount=0,preparedCount=0,publishedCount=0;
+ for(const auto &peer:s.peers){peerCount+=peer.key.valid();preparedCount+=peer.prepared;publishedCount+=peer.published;}
+ const char *multiKeys[]={"PeerCount","PeerPreparedCount","PeerPublishedCount","PeerCapacity","PeerFlightIndex"};
+ const uint64_t multiValues[]={peerCount,preparedCount,publishedCount,s.PeerCapacity,s.peerFlight?s.flightPeer:s.PeerCapacity};
+ for(unsigned i=0;i<5&&ok;++i){auto v=OSNumber::withNumber(multiValues[i],64);if(!v){ok=false;break;}ok=d->setObject(multiKeys[i],v);v->release();}
  const char *addressKeys[]={"RxAddressedLocal","RxAddressedGroup","RxAddressedForeign"};
  const uint32_t addressValues[]={s.rxAddressedLocal,s.rxAddressedGroup,s.rxAddressedForeign};
  for(unsigned i=0;i<3&&ok;++i){auto v=OSNumber::withNumber(addressValues[i],32);if(!v){ok=false;break;}ok=d->setObject(addressKeys[i],v);v->release();}

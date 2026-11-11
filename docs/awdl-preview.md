@@ -1,3 +1,5 @@
+> Historical preview-1 record. For the current r26 experimental beta and its separate evidence/limitations, see [current status](awdl-status.md).
+
 # November 8, 2026 AirDrop receive test — DDA9 / preview-1
 
 | Field | Observed value |

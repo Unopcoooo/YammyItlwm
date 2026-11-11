@@ -6,3 +6,5 @@ project.xcworkspace
 FwBinary.cpp
 *.pyc
 MacKernelSDK
+
+__pycache__/

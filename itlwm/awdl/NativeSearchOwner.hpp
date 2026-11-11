@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "NativeReceivePolicy.hpp"
+#include <sys/errno.h>
 #include <stdint.h>
 #include <string.h>
 namespace ItlAwdl {
@@ -12,6 +13,7 @@ struct NativeSearchOwner {
  Phase phase=Phase::Idle;
  uint64_t epoch=0,startNs=0,deadlineNs=0;
  uint32_t generation=0;
+ uint32_t stopReason=0;
  uint8_t local[6]={};
  bool stopRequested=false,expired=false,configuredOnce=false;
  int32_t failure=0;
@@ -41,8 +43,9 @@ struct NativeSearchOwner {
      stopRequested||now<startNs||now>=deadlineNs)return false;
   configuredOnce=true;phase=Phase::Searching;return true;
  }
- bool stop(uint64_t e){
+ bool stop(uint64_t e,uint32_t reason=0){
   if(!matches(e))return false;
+  if(!stopReason)stopReason=reason;
   if(phase==Phase::Stopping||phase==Phase::Recovering){stopRequested=true;return true;}
   if(phase==Phase::Cancelled)return true;
   if(phase!=Phase::Starting&&phase!=Phase::Searching)return false;
@@ -77,4 +80,10 @@ struct NativeSearchOwner {
  }
  // Searching is receive residency, never a claim that BSD/peer data is ready.
 };
+// A failed session may be replaced only by a new explicit user epoch after the
+// old radio/image has been fully retired. This is not an automatic retry.
+inline bool cleanFailedSearchRetired(const NativeSearchOwner &o,bool retired,bool clean){
+ return o.epoch&&o.configuredOnce&&o.phase==NativeSearchOwner::Phase::Failed&&
+  o.failure==EIO&&!o.stopRequested&&!o.expired&&retired&&clean;
+}
 }

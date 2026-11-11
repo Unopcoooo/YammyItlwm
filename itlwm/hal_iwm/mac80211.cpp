@@ -937,6 +937,8 @@ out:
 }
 
 #ifdef AIRPORT_WCL
+#include "../awdl/NativeElectionParams.hpp"
+#include "../awdl/NativeUmiRuntime.hpp"
 #include "../awdl/AuxRocRuntime.hpp"
 #include "../awdl/RawRxRuntime.hpp"
 #include "../awdl/AuxTxRuntime.hpp"
@@ -958,8 +960,10 @@ out:
 #include "../awdl/NativeSyncPreflightRuntime.hpp"
 #include "../awdl/NativeSearchControlTxRuntime.hpp"
 #include "../awdl/NativeSyncRoleRuntime.hpp"
+#include "../awdl/NativeElectionRuntime.hpp"
 #include "../awdl/NativeDiscoveryPeerRuntime.hpp"
 #include "../awdl/NativeDiscoveryRuntime.hpp"
+#include "../awdl/DataDriver.hpp"
 #include "../awdl/NativeSyncParamsRuntime.hpp"
 #include "../awdl/BatchRuntime.hpp"
 #include "../awdl/ActionFrame.hpp"
@@ -967,7 +971,36 @@ out:
 #include "../awdl/ElectionParameters.hpp"
 #include "../awdl/SyncParameters.hpp"
 
-void ItlIwm::observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2)
+extern "C" void ItlNativeAwdlBpfInput(void *, mbuf_t, uint32_t, void *, size_t)
+    __asm__("__ZN23IO80211VirtualInterface11bpfTapInputEP6__mbufjPvm");
+
+static bool feedNativeAwdlPeer(mbuf_t frame, size_t length, int channel, int rssi)
+{
+    enum { Apple80211Version = 1, Apple80211Channel2GHz = 0x8, Apple80211Channel5GHz = 0x10 };
+    auto interface = ItlAwdl::gDataPort.owner;
+    if (!interface || !frame || length <= 24)
+        return false;
+    const auto bytes = static_cast<const uint8_t *>(mbuf_data(frame));
+    uint8_t header[72] = {};
+    memcpy(header, bytes + 10, 6);
+    const uint32_t channelInfo[] = {
+        Apple80211Version,
+        uint32_t(channel),
+        channel <= 14 ? Apple80211Channel2GHz : Apple80211Channel5GHz,
+    };
+    memcpy(header + 12, channelInfo, sizeof(channelInfo));
+    memcpy(header + 0x2c, &rssi, sizeof(rssi));
+    // The native action-frame path expects the AWDL body after the 802.11
+    // header; otherwise isValidAF checks the frame-control bytes as the OUI.
+    mbuf_t body = nullptr;
+    if (mbuf_copym(frame, 24, length - 24, MBUF_DONTWAIT, &body) || !body)
+        return false;
+    ItlNativeAwdlBpfInput(interface, body, 12, header, sizeof(header));
+    mbuf_freem(body);
+    return true;
+}
+
+void ItlIwm::observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2, int receiveRssi)
 {
     if (!awdlProbeEnabled || !frame)
         return;
@@ -1013,6 +1046,8 @@ void ItlIwm::observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2)
         case ItlAwdl::Result::Unsupported: awdlProbeCounters->add(Counters::UnsupportedAction); return;
         case ItlAwdl::Result::NotAwdl: awdlProbeCounters->add(Counters::OtherAction); return;
     }
+    awdlProbeCounters->add(feedNativeAwdlPeer(frame, length, channel, receiveRssi) ?
+        Counters::NativePeerFeedOk : Counters::NativePeerFeedFail);
     const auto ic = &com.sc_ic;
     if (withinRoc) { awdlProbeCounters->add(Counters::RocAwdlFramesOnChannel);++awdlRocAwdlFrames; }
     awdlProbeCounters->add(ic->ic_state == IEEE80211_S_RUN ? Counters::AwdlDuringRun : Counters::AwdlOutsideRun);
@@ -1201,7 +1236,7 @@ iwm_rx_frame(struct iwm_softc *sc, mbuf_t m, int chanidx,
 #ifdef AIRPORT_WCL
     awdlIbssExperimentCommon(m,chanidx,device_timestamp,rx_pkt_status);
     awdlRawRxCommon(m,chanidx,device_timestamp,rx_pkt_status);
-    observeAwdlFrame(m, chanidx, device_timestamp);
+    observeAwdlFrame(m, chanidx, device_timestamp, rxi->rxi_rssi + IWM_MIN_DBM);
     if(ItlAwdl::gSingleDataProbe.submitted&&mbuf_len(m)==mbuf_pkthdr_len(m)&&
        ItlAwdl::gSingleDataProbe.reply(static_cast<const uint8_t *>(mbuf_data(m)),mbuf_len(m),
            sc->sc_generation,chanidx,device_timestamp,itlAwdlRocNowNs()))awdlSingleDataProbePublish();

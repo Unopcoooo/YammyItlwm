@@ -51,7 +51,7 @@ int main(){
     assert(!buildServiceMifAction(raw,110,identityOnly,10,out,sizeof(out),used));
     assert(buildServiceMifAction(raw,110,i,10,out,sizeof(out),used));
     assert(contains(out,used,"fresh-instance")&&contains(out,used,"fresh-host")&&contains(out,used,"x=y"));
-    assert(!contains(out,used,"02aabbccddee")&&!contains(out,used,"private-test-host")&&!contains(out,used,"flags=13311"));
+    assert(!contains(out,used,"631e8a6b05fe")&&!contains(out,used,"deMacBook-Pro")&&!contains(out,used,"flags=13311"));
     // Compare the SRV port to the caller's current registration, independent of labels.
     bool portFound=false;for(size_t n=0;n+6<used;++n)if(out[n]==33&&out[n+1]==19&&out[n+2]==0){
         if(out[n+9]==(9123>>8)&&out[n+10]==(9123&255))portFound=true;

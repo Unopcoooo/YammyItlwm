@@ -4,6 +4,8 @@
 #include "IbssPeer.hpp"
 #include "Descriptor.hpp"
 namespace ItlIbss {
+// Match normal IWM unicast traffic instead of the old one-retry probe setting.
+constexpr uint8_t kPeerDataRetryLimit=15,kPeerRtsRetryLimit=3;
 inline bool samePeerGrant(const PeerGrant &a,const PeerGrant &b){
  const auto &x=a.base;const auto &y=b.base;
  return a.valid()&&b.valid()&&a.generation==b.generation&&a.station==b.station&&a.queue==b.queue&&a.color==b.color&&
@@ -31,7 +33,8 @@ inline bool peerDataDescriptor(const PeerState &s,const uint8_t *frame,size_t le
  if(headerLength==26){txLe32(&tx->tx_flags,IWM_TX_CMD_FLG_ACK|(priority<<IWM_TX_CMD_FLG_BT_PRIO_POS)|IWM_TX_CMD_FLG_MH_PAD);txLe16(&tx->offload_assist,IWM_TX_CMD_OFFLD_PAD);}
  txLe32(&tx->rate_n_flags,0x0d|(uint32_t(antenna)<<14));
  // Raw experimental field value, as in the AUX data probe; units remain unproven.
- txLe32(&tx->life_time,4000);tx->data_retry_limit=tx->rts_retry_limit=1;
+ txLe32(&tx->life_time,4000);tx->data_retry_limit=kPeerDataRetryLimit;
+ tx->rts_retry_limit=kPeerRtsRetryLimit;
  txLe32(&tx->dram_lsb_ptr,uint32_t(scratchAddress));tx->dram_msb_ptr=uint8_t(scratchAddress>>32);
  memcpy(command.data+sizeof(*tx),frame,headerLength);
  const unsigned tail=(sizeof(iwm_cmd_header)+sizeof(*tx)+headerLength-20+3)&~3u;
@@ -82,6 +85,11 @@ public:
  bool rearmAfterAck(unsigned maximumFrames=3){return maximumFrames<=16&&rearmOwned(true,maximumFrames);}
  // Native session remains bounded by the original lease and matching DMA retirement.
  bool rearmWithinLease(){return rearmOwned(false,0);}
+ // A reclaimed LONG_LIMIT frame may cross an AWDL window boundary exactly once per retry.
+ bool rearmAfterLoss(){
+  if(!done||held||owner.pending||!owner.recycle())return false;
+  ++reuses;used=published=done=ack=false;status=UINT32_MAX;peer.dataUsed=false;return true;
+ }
  // 0x83 is firmware LONG_LIMIT; delivery failed but the matching DMA completion reclaimed the buffer.
  bool retryExhaustedReclaimed(){return !ack&&(status&IWM_TX_STATUS_MSK)==0x83&&canRecycle(true);}
  // Only the native caller may classify an elapsed window; this proves no DMA publication occurred.

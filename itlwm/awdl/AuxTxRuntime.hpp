@@ -49,13 +49,15 @@ void ItlIwm::awdlAuxTxPublish() {
 bool ItlIwm::awdlAuxTxDrain() { return !awdlAuxTx.pending; }
 void ItlIwm::awdlAuxTxStart(bool dataOnly) {
     using C = ItlAwdlProbeCounters;
-    if (!awdlAuxTxEnabled || !awdlProbeCounters) return;
+    auto &umi = gItlNativeUmi;
+    const bool umiReady = umi.owner == this && umi.pending && !umi.flight;
+    if ((!awdlAuxTxEnabled && !umiReady) || !awdlProbeCounters) return;
     uint8_t raw[ItlAwdl::kSyncTemplateCapacity];
     uint8_t frame[1536];
     ItlAwdl::TemplateFrameInput input;
     uint32_t rawLength = 0,rawRevision=0;
     size_t frameLength = 0;bool singleData=false;
-    if (awdlTemplateTxEnabled) {
+    if (awdlTemplateTxEnabled && !umiReady) {
         if (!ItlAwdl::snapshotSyncTemplate(raw, sizeof(raw), rawLength,&rawRevision)) {
             ItlAwdl::gTemplateRadio.lastSkip=13;
             awdlProbeCounters->add(C::AuxTxSkipped);
@@ -89,7 +91,7 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
     const uint8_t antenna = validAnts & uint8_t(-validAnts);
     if (!antenna || !iwm_nic_lock(sc)) { skip(true, 5); return; }
     uint32_t gp2 = iwm_read_prph(sc, IWM_DEVICE_SYSTEM_TIME_REG); iwm_nic_unlock(sc);
-    if (awdlTemplateTxEnabled) {
+    if (awdlTemplateTxEnabled && !umiReady) {
         auto &radio=ItlAwdl::gTemplateRadio;
         if(!radio.startAligned||!radio.targetValid||
            !ItlAwdl::templateSnapshot(input.sync,input.service,input.revision)) {skip(false,16);return;}
@@ -112,12 +114,30 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
         if (!built) {
             skip(false, 6); return;
         }
+    } else if (umiReady) {
+        if (dataOnly) return;
+        uint8_t source[6] = {};
+        if (!awdlIbssLocalAddress(source) ||
+            !ItlAwdl::buildNativeUmiFrame(umi.peer, source, umi.payload, umi.length,
+                                          gp2, uint16_t(awdlTemplateSequence & 0x0fff),
+                                          frame, sizeof(frame), frameLength)) {
+            ++umi.dropped;
+            umi.pending = false;
+            umi.length = 0;
+            awdlNativeUmiPublish();
+            skip(false, 25);
+            return;
+        }
     } else {
         if(dataOnly)return;
         if (!ItlAwdl::buildAuxTxProbe(ic->ic_myaddr, gp2, frame)) { skip(false, 7); return; }
         frameLength = 40;
     }
     auto windowOpen=[&](uint32_t now)->bool {
+        if(umiReady)return awdlRocSession.mayTransmit(sc->sc_generation) &&
+            awdlRocSession.generation==uint32_t(sc->sc_generation) &&
+            int32_t(now-awdlRocSession.startGp2)>=0 &&
+            uint32_t(now-awdlRocSession.startGp2)+2000<=awdlRocDurationTu*1024u;
         if(!awdlTemplateTxEnabled)return ItlAwdl::auxTxWindowOpen(sc->sc_generation,
             awdlRocSession.generation,now,awdlRocSession.startGp2,awdlRocSession.mayTransmit(sc->sc_generation));
         return awdlRocSession.mayTransmit(sc->sc_generation)&&
@@ -136,7 +156,7 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
     if (!nsegs) { mbuf_freem(m); skip(true, 11); return; }
     if (!iwm_nic_lock(sc)) { mbuf_freem(m); skip(true, 12); return; }
     gp2 = iwm_read_prph(sc, IWM_DEVICE_SYSTEM_TIME_REG); iwm_nic_unlock(sc);
-    if(!windowOpen(gp2)||(awdlTemplateTxEnabled&&uint32_t(gp2-input.gp2)>2000)){
+    if(!windowOpen(gp2)||(awdlTemplateTxEnabled&&!umiReady&&uint32_t(gp2-input.gp2)>2000)){
         mbuf_freem(m);skip(false,14);return;
     }
     auto command = &ring->cmd[idx];
@@ -155,7 +175,7 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
         desc->tbs[i+2].lo = htole32(segments[i].location);
         desc->tbs[i+2].hi_n_len = htole16(iwm_get_dma_hi_addr(segments[i].location) | (segments[i].length << 4));
     }
-    if(awdlTemplateTxEnabled){
+    if(awdlTemplateTxEnabled && !umiReady){
         ItlAwdl::TemplateSyncConfig freshSync;ItlAwdl::TemplateService freshService;uint32_t revision;
         if(!ItlAwdl::syncTemplateRevisionMatches(rawRevision)||
            !ItlAwdl::templateSnapshot(freshSync,freshService,revision)||revision!=input.revision||
@@ -176,6 +196,11 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
     if (!awdlAuxTx.submit(sc->sc_generation, qid, idx, itlAwdlRocNowNs() + 2000000000ULL)) {
         mbuf_freem(m); skip(true, 15); return;
     }
+    if (umiReady) {
+        umi.flight = true;
+        ++umi.submitted;
+        awdlNativeUmiPublish();
+    }
     if(singleData&&!ItlAwdl::gSingleDataProbe.publish(sc->sc_generation,qid,idx,gp2,itlAwdlRocNowNs(),frame,frameLength)){
         awdlAuxTx.complete(sc->sc_generation,qid,idx);awdlAuxTx.recycle();mbuf_freem(m);skip(false,24);return;
     }
@@ -191,7 +216,7 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
     awdlProbeCounters->setRoc(C::TxQueue, qid); awdlProbeCounters->setRoc(C::TxIndex, idx);
     awdlProbeCounters->setRoc(C::TxSubmittedGp2, gp2); awdlProbeCounters->add(C::AuxTxSubmitted);
     awdlAuxTxPublish();
-    if(awdlTemplateTxEnabled){
+    if(awdlTemplateTxEnabled && !umiReady){
         auto &radio=ItlAwdl::gTemplateRadio;
         radio.pendingSingleData=singleData;
         if(!singleData){
@@ -201,8 +226,8 @@ void ItlIwm::awdlAuxTxStart(bool dataOnly) {
         radio.lastAw=input.clock.aw(input.gp2,input.sync);radio.lastDown=input.clock.down(input.gp2,input.sync);
         radio.lastTxGp2=input.gp2;radio.lastStartGp2=input.startGp2;radio.lastSkip=0;
         }
-        ++awdlTemplateSequence;
     }
+    if(awdlTemplateTxEnabled || umiReady) ++awdlTemplateSequence;
     __sync_synchronize();
     IWM_WRITE(sc, IWM_HBUS_TARG_WRPTR, (qid << 8) | ring->cur);
     if(singleData)awdlSingleDataProbePublish();
@@ -221,7 +246,15 @@ bool ItlIwm::awdlAuxTxComplete(unsigned qid, unsigned idx, uint32_t status) {
     // Queue ownership is gone at this point. A failed frame must not stop the
     // bounded experiment; counters retain the failure while the next ROC gets
     // one fresh frame.
-    if (awdlTemplateTxEnabled) {
+    if (gItlNativeUmi.owner == this && gItlNativeUmi.flight) {
+        const bool success = code == IWM_TX_STATUS_SUCCESS || code == IWM_TX_STATUS_DIRECT_DONE;
+        gItlNativeUmi.pending = gItlNativeUmi.flight = false;
+        gItlNativeUmi.length = 0;
+        gItlNativeUmi.deadlineNs = 0;
+        if (success) ++gItlNativeUmi.completed; else ++gItlNativeUmi.failed;
+        awdlNativeUmiPublish();
+        awdlAuxTx.recycle();
+    } else if (awdlTemplateTxEnabled) {
         if(ItlAwdl::gTemplateRadio.pendingSingleData){
             ItlAwdl::gSingleDataProbe.complete(com.sc_generation,qid,idx,status,code==IWM_TX_STATUS_SUCCESS);
             ItlAwdl::gTemplateRadio.pendingSingleData=false;awdlSingleDataProbePublish();
@@ -241,11 +274,25 @@ bool ItlIwm::awdlAuxTxComplete(unsigned qid, unsigned idx, uint32_t status) {
 void ItlIwm::awdlAuxTxTick() {
     auto &probe=ItlAwdl::gSingleDataProbe;const auto phase=probe.phase;const auto reason=probe.reason;
     probe.tick(com.sc_generation,itlAwdlRocNowNs());
+    const uint64_t now = itlAwdlRocNowNs();
+    if (gItlNativeUmi.owner == this && !gItlNativeUmi.flight &&
+        (gItlNativeUmi.pending || gItlNativeUmi.deadlineNs) &&
+        now >= gItlNativeUmi.deadlineNs) {
+        ++gItlNativeUmi.dropped;
+        gItlNativeUmi.pending = false;
+        gItlNativeUmi.length = 0;
+        gItlNativeUmi.deadlineNs = 0;
+        awdlNativeUmiPublish();
+    }
+    if(!awdlAuxTx.pending&&gItlNativeUmi.owner==this&&
+       gItlNativeUmi.pending&&!gItlNativeUmi.flight)awdlAuxTxStart();
     if(awdlAuxTxEnabled&&!awdlAuxTx.pending&&probe.phase==ItlAwdl::SingleDataPhase::Armed)awdlAuxTxStart(true);
     if(probe.phase!=phase||probe.reason!=reason||probe.lastBlockReason!=probe.publishedBlockReason)awdlSingleDataProbePublish();
-    if (!awdlAuxTxEnabled || !awdlAuxTx.pending || awdlAuxTx.generation != uint32_t(com.sc_generation)) return;
+    const bool nativeUmi = gItlNativeUmi.owner == this &&
+        (gItlNativeUmi.pending || gItlNativeUmi.flight);
+    if ((!awdlAuxTxEnabled && !nativeUmi) || !awdlAuxTx.pending ||
+        awdlAuxTx.generation != uint32_t(com.sc_generation)) return;
     using C = ItlAwdlProbeCounters;
-    const auto now = itlAwdlRocNowNs();
     if (awdlAuxTx.flushSent) {
         if (awdlAuxTx.phase != ItlAwdl::AuxTxPhase::Quarantined && now > awdlAuxTx.deadlineNs) {
             awdlProbeCounters->add(C::AuxTxCleanupTimeouts); awdlAuxTx.quarantine(); awdlAuxTxPublish();

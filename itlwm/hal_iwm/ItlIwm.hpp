@@ -74,7 +74,7 @@ public:
     bool awdlMgmtFilterEnabled = false;
     bool awdlProbeRxSeen = false;
     uint32_t awdlProbeLogged = 0;
-    void observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2);
+    void observeAwdlFrame(mbuf_t frame, int channel, uint32_t receiveGp2, int receiveRssi);
     ItlIbss::ExclusiveState awdlIbssExclusive;
     ItlIbss::OneShot awdlIbssOneShot;
     ItlIbss::BatchControl awdlBatch;
@@ -156,6 +156,9 @@ public:
     void awdlNativeSearchPublish();
     IOReturn awdlNativeSearchEnable();
     bool awdlNativeSearchEnabled();
+    bool awdlNativeSyncRequested = false;
+    volatile uint64_t awdlHostSearchStopEpoch = 0;
+    volatile SInt32 awdlHostSearchStopPending = 0;
     bool awdlNativeSearchMasterChannel(uint32_t &channel);
     void awdlNativeSyncStatePreflight(const void *payload,unsigned length);
     IOReturn awdlNativeSyncParams(void *payload,unsigned length,OSObject *owner,bool set);
@@ -163,6 +166,13 @@ public:
     bool awdlNativeSyncRoleReady();
     bool awdlNativeSyncRoleConfirmed();
     IOReturn awdlNativeSyncRole(void *payload,unsigned length,OSObject *owner,bool set);
+    IOReturn awdlNativeElectionParams(const void *payload,size_t length,OSObject *owner);
+    IOReturn awdlNativeElectionMetric(const void *payload,size_t length,OSObject *owner);
+    IOReturn awdlNativeElectionMetricRead(uint32_t &metric,uint8_t &overrideMetric);
+    void awdlNativeElectionPublish();
+    IOReturn awdlNativeUmiRequest(const uint8_t peer[6],const uint8_t *payload,size_t length,
+                                  uint8_t kind);
+    void awdlNativeUmiPublish();
     IOReturn awdlNativeControlTxArm(uint64_t epoch,bool periodic=false);
     void awdlNativeControlTxTick();
     void awdlNativeControlTxStop(unsigned reason);
@@ -247,6 +257,14 @@ public:
     ItlAwdl::PeerRocPlan awdlPeerRocPlan;
     bool awdlAuxTxEnabled = false;
     bool awdlTemplateTxEnabled = false;
+    bool awdlNativeElectionValid = false;
+    uint8_t awdlNativeElectionRaw[56] = {};
+    uint8_t awdlNativeElectionMaster[6] = {};
+    uint32_t awdlNativeElectionRootMetric = 0;
+    uint32_t awdlNativeElectionSelfMetric = 0;
+    bool awdlNativeElectionMetricValid = false;
+    uint32_t awdlNativeElectionMetricRequested = 0;
+    uint8_t awdlNativeElectionMetricOverride = 0;
     uint32_t awdlTemplateSequence = 0;
     unsigned awdlScanSubmitting = 0; // protected by main work-loop gate
     ItlAwdl::AuxTxOwnership awdlAuxTx;

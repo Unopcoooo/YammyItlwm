@@ -296,7 +296,8 @@ public:
                    RocStarts, RocEnds, RocFailedNotifications, RocTimeouts, RocCancels,
                    RocIgnoredNotifications, RocHardwareResets, RocFramesOnChannel, RocAwdlFramesOnChannel,
                    AuxTxAttempts, AuxTxSubmitted, AuxTxCompleted, AuxTxSuccess, AuxTxFailed,
-                   AuxTxFlushes, AuxTxFlushErrors, AuxTxCleanupTimeouts, AuxTxSkipped, AuxTxResourceErrors, TimingConsistent, TimingInconsistent,
+                   AuxTxFlushes, AuxTxFlushErrors, AuxTxCleanupTimeouts, AuxTxSkipped, AuxTxResourceErrors,
+                   NativePeerFeedOk, NativePeerFeedFail, TimingConsistent, TimingInconsistent,
                    Count };
     void add(Counter c) { __atomic_fetch_add(&values[c], uint64_t(1), __ATOMIC_RELAXED); }
     bool serialize(OSSerialize *serializer) const override {
@@ -321,7 +322,8 @@ public:
             "RocStarts", "RocEnds", "RocFailedNotifications", "RocTimeouts", "RocCancels",
             "RocIgnoredNotifications", "RocHardwareResets", "RocFramesOnChannel", "RocAwdlFramesOnChannel",
             "AuxTxAttempts", "AuxTxSubmitted", "AuxTxCompleted", "AuxTxSuccess", "AuxTxFailed",
-            "AuxTxFlushes", "AuxTxFlushErrors", "AuxTxCleanupTimeouts", "AuxTxSkipped", "AuxTxResourceErrors", "TimingConsistent", "TimingInconsistent"
+            "AuxTxFlushes", "AuxTxFlushErrors", "AuxTxCleanupTimeouts", "AuxTxSkipped", "AuxTxResourceErrors",
+            "NativePeerFeedOk", "NativePeerFeedFail", "TimingConsistent", "TimingInconsistent"
         };
         static_assert(sizeof(names) / sizeof(names[0]) == Count, "counter name table out of sync");
         auto dict = OSDictionary::withCapacity(Count + 1);

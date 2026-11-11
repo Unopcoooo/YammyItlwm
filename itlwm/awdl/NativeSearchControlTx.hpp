@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include "BoundedControlSchedule.hpp"
+#include "NativeAwWindow.hpp"
 struct ItlIbssTxPort;
 namespace ItlAwdl {
 // One explicit pair or periodic diagnostic per HAL lifetime; never a role-ready state.
@@ -13,6 +14,7 @@ struct NativeSearchControlTx {
  bool periodic=false,nativeRoleAccepted=false,resumePriorMaster=false,drainedAtSearchStop=false;
  uint32_t stopBlockers=0;
  BoundedControlSchedule schedule;
+ NativeAwWindowTracker awWindow;
  uint64_t roleQuietUntilNs=0;
  // Evidence from before stop/cancel can release any transport state.
  bool reusableTerminal()const{

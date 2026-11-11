@@ -50,6 +50,8 @@ void ItlIwm::awdlDiscoveryTimerAction(OSObject *owner,IOTimerEventSource *sender
             if(hal->awdlTemplateTxEnabled&&hal->awdlRocTicks>=10){
                 const uint64_t now=itlAwdlRocNowNs(),wake=ItlAwdl::gTemplateRadio.nextWakeNs;
                 uint32_t wait=idle?(ItlAwdl::gTemplateRadio.targetValid?500:500000):20000;
+                if(gItlNativeUmi.owner==hal&&gItlNativeUmi.pending&&!gItlNativeUmi.flight)
+                    wait=1000;
                 if(wake>now)wait=uint32_t(MIN(uint64_t(20000),MAX(uint64_t(100),(wake-now)/1000)));
                 sender->setTimeoutUS(wait);
             }else sender->setTimeoutMS(hal->awdlRocTicks>=10?20:500);

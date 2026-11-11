@@ -130,6 +130,12 @@ void ItlIwm::awdlIbssExperimentWorker(void *argument,void *) {
                 const auto controlWait=hal->awdlNativeControlTx.schedule.wakeUs(now);
                 if(controlWait<waitUs)waitUs=controlWait;
             }
+            if(search&&hal->awdlNativeControlTx.nativeRoleAccepted&&
+               hal->awdlNativeControlTx.active()&&hal->awdlNativeControlTx.epochHostNs){
+                const auto awWait=ItlAwdl::NativeAwWindowTracker::nextBoundaryUs(
+                    now,hal->awdlNativeControlTx.epochHostNs);
+                if(awWait&&awWait<waitUs)waitUs=awWait;
+            }
             if(search&&hal->awdlNativeDiscovery.used&&(hal->awdlNativeDiscovery.txCount||hal->awdlNativeDiscovery.port)){
                 if(waitUs>1000)waitUs=1000;
             }
