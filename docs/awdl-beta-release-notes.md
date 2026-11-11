@@ -1,8 +1,11 @@
-# AC9560 Native AirDrop — Experimental Beta 1 (r26)
+# YammyItlwm — Experimental Beta 1 (r26)
+
+**A little taste of native AirDrop on Intel Wi‑Fi.**\
+给 Intel 无线，尝一口原生隔空投送。
 
 这是一份**完整链路验证 Beta**：已实现**黑苹果与苹果设备之间的原生 AirDrop 双向文件传输**，包括**同 Apple Account 设备的发送与接收**，以及**不同 Apple Account 设备之间的互相发现与互传**。同时接入 Finder 原生接收开关，支持手动开启、停止及普通 Wi-Fi 恢复。
 
-硬件实测仅覆盖同一张 Intel Wireless-AC 9560（8086:a370）、Intel 蓝牙8087:0AAA、macOS Sequoia15.8.1（24H32）。具体设备和逐版本复测范围见[状态与证据](https://github.com/Unopcoooo/itlwm/blob/awdl/sequoia-ac9560-preview/docs/awdl-status.md)。
+硬件实测仅覆盖同一张 Intel Wireless-AC 9560（8086:a370）、Intel 蓝牙8087:0AAA、macOS Sequoia15.8.1（24H32）。具体设备和逐版本复测范围见[状态与证据](https://github.com/Unopcoooo/YammyItlwm/blob/awdl/sequoia-ac9560-preview/docs/awdl-status.md)。
 
 ## 额外进展
 
