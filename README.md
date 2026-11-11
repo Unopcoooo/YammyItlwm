@@ -4,6 +4,8 @@
 
 macOS Sequoia **15.8.1（24H32）/ x86_64 / Intel Wireless-AC 9560** 的原生 AirDrop 实验实现。已实现**黑苹果与苹果设备之间的原生 AirDrop 双向文件传输**，包括**同 Apple Account 设备的发送与接收**，以及**不同 Apple Account 设备之间的互相发现与互传**。使用系统 Finder / 分享菜单，没有第三方文件传输协议替代。
 
+**额外进展：黑苹果 → iPhone 的剪贴板共享也已成功。** 这是修复过程中的实机观察，具体由哪次修改恢复尚未定位；目前确认的是这一方向。
+
 **这次发布的意义是打通原生发现、连接和文件收发链路，不是已经达到日常可用的性能、稳定性或兼容范围。**
 
 [Beta 使用与安装说明](docs/awdl-beta.md) · [已知问题与实测](docs/awdl-status.md) · [后续路线与致谢](docs/awdl-roadmap.md) · [最早接收里程碑](docs/awdl-preview.md)
@@ -27,6 +29,8 @@ macOS Sequoia **15.8.1（24H32）/ x86_64 / Intel Wireless-AC 9560** 的原生 A
 ## Any tops here?
 
 Native AirDrop file transfers in both directions between the Intel AC9560 Hackintosh and Apple devices, including sending and receiving with devices on the same Apple Account, and mutual discovery and file transfers with devices on different Apple Accounts. The beta also includes a manual Finder receive switch and a bounded five-minute session. **Broader hardware compatibility and stable cold-start transfers are not guaranteed.**
+
+**Additional progress: clipboard sharing from the Hackintosh to iPhone also works.** This was observed during the repair work; the change that restored it has not yet been identified. Only this direction is currently confirmed.
 
 Only one physical AC9560 has been tested, on macOS 15.8.1 build 24H32. The radio is exclusive: infrastructure Wi-Fi disconnects during AWDL. Coexistence, reliability, sleep/wake behavior, progress UI, and throughput remain ongoing work. A three-second small-file success is not a speed benchmark. The maintainer recently graduated and cannot afford a broad hardware test matrix; reproducible community reports and code contributions are welcome.
 

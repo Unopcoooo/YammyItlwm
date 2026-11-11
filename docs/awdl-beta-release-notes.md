@@ -4,6 +4,10 @@
 
 硬件实测仅覆盖同一张 Intel Wireless-AC 9560（8086:a370）、Intel 蓝牙8087:0AAA、macOS Sequoia15.8.1（24H32）。具体设备和逐版本复测范围见[状态与证据](https://github.com/Unopcoooo/itlwm/blob/awdl/sequoia-ac9560-preview/docs/awdl-status.md)。
 
+## 额外进展
+
+**额外进展：黑苹果 → iPhone 的剪贴板共享也已成功。** 这是修复过程中的实机观察，具体由哪次修改恢复尚未定位；目前确认的是这一方向。
+
 ## 包含什么
 - AirportItlwm r26：D6ED6749-6BCD-332E-871C-667166716DEE。
 - BlueToolFixup E2CB：E2CB71B5-BA78-39EB-99AD-24F585C1C38A。
@@ -19,5 +23,7 @@
 
 ## English
 Full-path experimental beta: native AirDrop file transfers work in both directions between the AC9560 Hackintosh and Apple devices, including sending and receiving with devices on the same Apple Account, and mutual discovery and file transfers across different Apple Accounts. A manual Finder receive switch is included. Hardware testing covers only one physical AC9560, on Sequoia15.8.1 build24H32. Exclusive radio; ordinary Wi-Fi disconnects. Five-minute maximum lease, slow transfers, variable latency, incomplete progress UI and historical result inconsistencies. No broader hardware/OS compatibility or daily-use stability is claimed. The recently graduated maintainer cannot afford a broad hardware test matrix; community testing and contributions are welcome. Coexistence, reliability and speed remain ongoing work.
+
+**Additional progress: clipboard sharing from the Hackintosh to iPhone also works.** This was observed during the repair work; the change that restored it has not yet been identified. Only this direction is currently confirmed.
 
 Read the bundled installation/rollback guide. Two matched kexts **plus the user-space helper** are required for this tested workflow. Keep your own EFI/identity; no personal EFI or Apple system binary is included. Verify archive and binary hashes. Matching source and original licenses are included as a separate source asset.
