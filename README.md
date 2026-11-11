@@ -1,5 +1,7 @@
 # Intel AC9560 原生 AirDrop · Experimental Beta 1
 
+## 有1吗？
+
 macOS Sequoia **15.8.1（24H32）/ x86_64 / Intel Wireless-AC 9560** 的原生 AirDrop 实验实现。已实现**黑苹果与苹果设备之间的原生 AirDrop 双向文件传输**，包括**同 Apple Account 设备的发送与接收**，以及**不同 Apple Account 设备之间的互相发现与互传**。使用系统 Finder / 分享菜单，没有第三方文件传输协议替代。
 
 **这次发布的意义是打通原生发现、连接和文件收发链路，不是已经达到日常可用的性能、稳定性或兼容范围。**
@@ -22,7 +24,7 @@ macOS Sequoia **15.8.1（24H32）/ x86_64 / Intel Wireless-AC 9560** 的原生 A
 
 开发基于 [laobamac/itlwm](https://github.com/laobamac/itlwm) / [OpenIntelWireless](https://github.com/OpenIntelWireless/itlwm)，参考 [Owly](https://github.com/t4t5/owly)、Broadcom 社区实现及 Apple 原生行为；各项目的硬件代码不能直接互换。蓝牙补丁基于 [BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM) 和 [crazyhulk 的社区工作](https://github.com/crazyhulk/BlueToolFixup-FixA2DP-BLE)。原有许可证与署名保留。
 
-## What this beta demonstrates
+## Any tops here?
 
 Native AirDrop file transfers in both directions between the Intel AC9560 Hackintosh and Apple devices, including sending and receiving with devices on the same Apple Account, and mutual discovery and file transfers with devices on different Apple Accounts. The beta also includes a manual Finder receive switch and a bounded five-minute session. **Broader hardware compatibility and stable cold-start transfers are not guaranteed.**
 
