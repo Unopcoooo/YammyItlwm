@@ -1,6 +1,8 @@
 # AC9560 Native AirDrop — Experimental Beta 1 (r26)
 
-这是一份**完整链路验证 Beta**。在同一张 Intel Wireless-AC 9560（8086:a370）、Intel蓝牙8087:0AAA、macOS Sequoia15.8.1（24H32）上，已实测同Apple Account的iPhone↔黑苹果双向文件传输和两轮手动开关。历史版本还验证过与不同账号原生Mac的发现/收发；本次r26未把所有历史设备重新回归一遍。
+这是一份**完整链路验证 Beta**：已实现**黑苹果与苹果设备之间的原生 AirDrop 双向文件传输**，包括**同 Apple Account 设备的发送与接收**，以及**不同 Apple Account 设备之间的互相发现与互传**。同时接入 Finder 原生接收开关，支持手动开启、停止及普通 Wi-Fi 恢复。
+
+硬件实测仅覆盖同一张 Intel Wireless-AC 9560（8086:a370）、Intel 蓝牙8087:0AAA、macOS Sequoia15.8.1（24H32）。具体设备和逐版本复测范围见[状态与证据](https://github.com/Unopcoooo/itlwm/blob/awdl/sequoia-ac9560-preview/docs/awdl-status.md)。
 
 ## 包含什么
 - AirportItlwm r26：D6ED6749-6BCD-332E-871C-667166716DEE。
@@ -16,6 +18,6 @@
 我刚毕业，个人设备预算有限，暂时没法购买很多型号网卡测试。这次算是抛砖引玉，欢迎有设备、有经验的朋友带着版本、硬件ID和可复现结果一起参与。接下来继续推进Wi-Fi共存、稳定性、恢复速度与传输性能调优。
 
 ## English
-Full-path experimental beta: native same-account iPhone↔AC9560 file transfers and a manual receive switch have succeeded on one physical adapter, on Sequoia15.8.1 build24H32. Exclusive radio; ordinary Wi-Fi disconnects. Five-minute maximum lease, slow transfers, variable latency, incomplete progress UI and historical result inconsistencies. No broader hardware/OS compatibility or daily-use stability is claimed. The recently graduated maintainer cannot afford a broad hardware test matrix; community testing and contributions are welcome. Coexistence, reliability and speed remain ongoing work.
+Full-path experimental beta: native AirDrop file transfers work in both directions between the AC9560 Hackintosh and Apple devices, including sending and receiving with devices on the same Apple Account, and mutual discovery and file transfers across different Apple Accounts. A manual Finder receive switch is included. Hardware testing covers only one physical AC9560, on Sequoia15.8.1 build24H32. Exclusive radio; ordinary Wi-Fi disconnects. Five-minute maximum lease, slow transfers, variable latency, incomplete progress UI and historical result inconsistencies. No broader hardware/OS compatibility or daily-use stability is claimed. The recently graduated maintainer cannot afford a broad hardware test matrix; community testing and contributions are welcome. Coexistence, reliability and speed remain ongoing work.
 
 Read the bundled installation/rollback guide. Two matched kexts **plus the user-space helper** are required for this tested workflow. Keep your own EFI/identity; no personal EFI or Apple system binary is included. Verify archive and binary hashes. Matching source and original licenses are included as a separate source asset.
